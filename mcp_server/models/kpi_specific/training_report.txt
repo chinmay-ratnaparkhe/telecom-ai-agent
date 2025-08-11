@@ -1,0 +1,87 @@
+KPI-Specific Anomaly Detection Training Report
+==================================================
+
+Model Configuration:
+--------------------------------------------------
+
+RSRP:
+  Primary: isolation_forest
+  Secondary: statistical
+  Rationale: Point anomalies in signal strength
+  Valid Range: (-140, -40)
+  Parameters: {'contamination': 0.1, 'n_estimators': 100, 'z_threshold': 3.0}
+
+SINR:
+  Primary: lof
+  Secondary: isolation_forest
+  Rationale: Density-based for interference detection
+  Valid Range: (-50, 50)
+  Parameters: {'n_neighbors': 20, 'contamination': 0.1, 'n_estimators': 100}
+
+DL_Throughput:
+  Primary: autoencoder
+  Secondary: statistical
+  Rationale: Temporal patterns in traffic variations
+  Valid Range: (0, inf)
+  Parameters: {'sequence_length': 7, 'reconstruction_threshold': 3, 'contamination': 0.1}
+
+UL_Throughput:
+  Primary: autoencoder
+  Secondary: spc
+  Rationale: Temporal patterns and capacity limits
+  Valid Range: (0, inf)
+  Parameters: {'sequence_length': 7, 'control_limit': 3, 'contamination': 0.1}
+
+Call_Drop_Rate:
+  Primary: ensemble
+  Secondary: one_class_svm
+  Rationale: Multi-modal distribution handling
+  Valid Range: (0, 100)
+  Parameters: {'n_components': 3, 'contamination': 0.05, 'nu': 0.05}
+
+RTT:
+  Primary: isolation_forest
+  Secondary: moving_average
+  Rationale: Latency spike detection
+  Valid Range: (0, inf)
+  Parameters: {'contamination': 0.08, 'window': 7, 'n_estimators': 100}
+
+CPU_Utilization:
+  Primary: time_series_decomposition
+  Secondary: isolation_forest
+  Rationale: Strong temporal patterns
+  Valid Range: (0, 200)
+  Parameters: {'seasonal_periods': [7, 30], 'contamination': 0.05}
+
+Active_Users:
+  Primary: seasonal
+  Secondary: dbscan
+  Rationale: Seasonal usage patterns
+  Valid Range: (0, inf)
+  Parameters: {'alpha': 0.05, 'max_anoms': 0.1, 'eps': 50, 'min_samples': 5}
+
+Handover_Success_Rate:
+  Primary: gmm
+  Secondary: control_charts
+  Rationale: Success rate boundaries
+  Valid Range: (0, 100)
+  Parameters: {'n_components': 2, 'threshold': 2, 'contamination': 0.05}
+
+Packet_Loss:
+  Primary: one_class_svm
+  Secondary: isolation_forest
+  Rationale: Boundary-based detection
+  Valid Range: (0, 100)
+  Parameters: {'nu': 0.05, 'gamma': 'scale', 'contamination': 0.1}
+
+
+Training Data:
+  Total rows: 21060
+  Date range: 2024-01-01 00:00:00 to 2024-02-29 00:00:00
+  Sites: 100
+
+
+Anomaly Detection Test Results:
+  Test samples: 1000
+  Total anomalies: 596
+  Detection rate: 59.60%

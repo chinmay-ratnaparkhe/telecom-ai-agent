@@ -1,0 +1,27 @@
+{
+  "kpi_list": [
+    "RSRP",
+    "SINR",
+    "DL_Throughput",
+    "UL_Throughput",
+    "Call_Drop_Rate",
+    "RTT",
+    "CPU_Utilization",
+    "Active_Users",
+    "Handover_Success_Rate",
+    "Packet_Loss"
+  ],
+  "trained_models": [
+    "RSRP",
+    "SINR",
+    "DL_Throughput",
+    "UL_Throughput",
+    "Call_Drop_Rate",
+    "RTT",
+    "CPU_Utilization",
+    "Active_Users",
+    "Handover_Success_Rate",
+    "Packet_Loss"
+  ],
+  "timestamp": "2025-07-29T11:52:44.664868"
+}

@@ -1,0 +1,52 @@
+{
+  "RSRP": {
+    "algorithm": "isolation_forest",
+    "threshold": 0.5862569131076332,
+    "is_fitted": true
+  },
+  "SINR": {
+    "algorithm": "autoencoder",
+    "threshold": 26.37493085861206,
+    "is_fitted": true
+  },
+  "DL_Throughput": {
+    "algorithm": "isolation_forest",
+    "threshold": 0.5636928139834355,
+    "is_fitted": true
+  },
+  "UL_Throughput": {
+    "algorithm": "isolation_forest",
+    "threshold": 0.5651004141530315,
+    "is_fitted": true
+  },
+  "CPU_Utilization": {
+    "algorithm": "one_class_svm",
+    "threshold": -47.601995106934346,
+    "is_fitted": true
+  },
+  "Active_Users": {
+    "algorithm": "gaussian_mixture",
+    "threshold": 98.96017963170999,
+    "is_fitted": true
+  },
+  "RTT": {
+    "algorithm": "isolation_forest",
+    "threshold": 0.5587949530960511,
+    "is_fitted": true
+  },
+  "Packet_Loss": {
+    "algorithm": "one_class_svm",
+    "threshold": -48.85785382352704,
+    "is_fitted": true
+  },
+  "Call_Drop_Rate": {
+    "algorithm": "one_class_svm",
+    "threshold": -52.06316908362984,
+    "is_fitted": true
+  },
+  "Handover_Success_Rate": {
+    "algorithm": "gaussian_mixture",
+    "threshold": 91.49732352402191,
+    "is_fitted": true
+  }
+}
