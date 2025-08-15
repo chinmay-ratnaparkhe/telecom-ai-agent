@@ -51,7 +51,7 @@ In a new terminal:
 
 `ash
 cd src/telecom_ai_platform
-streamlit run ui/streamlit_app.py
+streamlit run streamlit_ui/app.py
 `
 
 ### 7. Access the Application

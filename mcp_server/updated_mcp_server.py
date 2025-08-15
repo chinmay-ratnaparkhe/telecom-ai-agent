@@ -276,10 +276,11 @@ def load_data_and_models():
     try:
         logger.info("Starting simplified data and model loading...")
         
-        # Check if data file exists
-        data_path = "telecom_mcp_server/data/processed_kpi_data.csv"
+        # Check if data file exists (prefer local mcp_server path)
+        data_path = os.path.join(os.path.dirname(__file__), 'data', 'processed_kpi_data.csv')
         if not os.path.exists(data_path):
             alternative_paths = [
+                os.path.join('mcp_server', 'data', 'processed_kpi_data.csv'),
                 "data/processed_kpi_data.csv",
                 "../data/processed_kpi_data.csv",
                 "processed_kpi_data.csv"
@@ -1404,6 +1405,38 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# --- MCP compatibility: tool registry and aliases ---
+# Internal tool names implemented by this server
+_INTERNAL_TOOLS = {
+    "detect_anomalies": detect_anomalies,
+    "analyze_kpi_trends": analyze_kpi_trends,
+    "get_site_summary": get_site_summary,
+    "compare_sites": compare_sites,
+    "list_available_data": list_available_data,
+    "visualize_anomalies": visualize_anomalies,
+    "governance_check": governance_check,
+}
+
+# Aliases to support different client mappings (e.g., 'anomaly_detector')
+_TOOL_ALIASES = {
+    "anomaly_detector": "detect_anomalies",
+    "kpi_analyzer": "analyze_kpi_trends",
+    "site_data_retriever": "get_site_summary",
+    "report_generator": "visualize_anomalies",
+    "trend_predictor": "analyze_kpi_trends",
+}
+
+# Simple input schemas for discovery (minimal, not strict JSON Schema)
+_TOOL_SPECS = [
+    {
+        "name": name,
+        "description": name.replace("_", " ").title(),
+        "inputSchema": {"required": []},
+        "outputSchema": {"type": "object"},
+    }
+    for name in _INTERNAL_TOOLS.keys()
+]
+
 @app.get("/")
 async def root():
     return {
@@ -1438,7 +1471,7 @@ async def health_check():
             "data_status": data_test,
             "data_shape": df.shape if df is not None else None,
             "available_endpoints": [
-                "/", "/health", "/call_tool"
+                "/", "/health", "/call_tool", "/tools", "/resources", "/tools/call", "/resources/read"
             ],
             "available_tools": [
                 "detect_anomalies", "analyze_kpi_trends", 
@@ -1453,6 +1486,136 @@ async def health_check():
             "error": str(e),
             "timestamp": datetime.now().isoformat()
         }
+
+# --- MCP compatibility endpoints ---
+@app.get("/tools")
+async def list_tools():
+    """Return available tools in MCP-compatible format."""
+    return {"tools": _TOOL_SPECS}
+
+
+@app.get("/resources")
+async def list_resources():
+    """Return available resources."""
+    resources = []
+    try:
+        base_dir = os.path.dirname(__file__)
+        data_file = os.path.join(base_dir, 'data', 'processed_kpi_data.csv')
+        if os.path.exists(data_file):
+            resources.append({
+                "uri": "telecom://data/processed_kpi_data.csv",
+                "name": "Processed KPI Dataset",
+                "description": "Primary processed KPI dataset used by the server",
+                "mimeType": "text/csv"
+            })
+    except Exception as e:
+        logger.error(f"Error listing resources: {e}")
+    return {"resources": resources}
+
+def _resolve_resource_uri(uri: str) -> Optional[str]:
+    """Safely resolve a resource URI to a local file path within allowed dirs."""
+    try:
+        if not uri:
+            return None
+        base_dir = os.path.dirname(__file__)
+        allowed_roots = [
+            os.path.join(base_dir, 'data'),
+            os.path.join(base_dir, 'models'),
+        ]
+        # Support custom telecom:// scheme and file://
+        if uri.startswith('telecom://'):
+            rel_path = uri.replace('telecom://', '').lstrip('/')
+            candidate = os.path.join(base_dir, rel_path)
+        elif uri.startswith('file://'):
+            # Prevent absolute access outside allowed roots
+            candidate = uri.replace('file://', '')
+            # If relative, join to base_dir
+            if not os.path.isabs(candidate):
+                candidate = os.path.join(base_dir, candidate)
+        else:
+            # Treat as relative to base_dir
+            candidate = os.path.join(base_dir, uri)
+
+        candidate = os.path.normpath(candidate)
+        # Ensure within allowed roots
+        if any(candidate.startswith(root) for root in allowed_roots):
+            return candidate if os.path.exists(candidate) else None
+        return None
+    except Exception as e:
+        logger.error(f"Error resolving resource URI '{uri}': {e}")
+        return None
+
+@app.get("/resources/read")
+async def read_resource(uri: str):
+    """Read a resource in a safe manner and return textual contents."""
+    try:
+        file_path = _resolve_resource_uri(uri)
+        if not file_path:
+            raise HTTPException(status_code=404, detail=f"Resource not found or not allowed: {uri}")
+
+        # Return small text or CSV head to avoid large payloads
+        content = None
+        if file_path.lower().endswith(('.csv', '.txt', '.log')):
+            try:
+                if file_path.lower().endswith('.csv'):
+                    # Return only header and first few lines
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        lines = []
+                        for i, line in enumerate(f):
+                            lines.append(line)
+                            if i >= 50:
+                                break
+                        content = ''.join(lines)
+                else:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read(8192)
+            except Exception as fe:
+                logger.error(f"Failed reading file resource: {fe}")
+                content = f"[Error reading resource contents: {fe}]"
+        else:
+            content = f"[Resource type not directly viewable: {os.path.basename(file_path)}]"
+
+        return {"uri": uri, "contents": {"text": content}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to read resource '{uri}': {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read resource: {e}")
+
+
+class MCPToolCall(BaseModel):
+    name: str
+    arguments: Dict[str, Any] = {}
+
+
+@app.post("/tools/call")
+async def mcp_tools_call(payload: MCPToolCall):
+    """Bridge MCP-style tool invocation to internal tools."""
+    try:
+        tool_name = payload.name
+        args = payload.arguments or {}
+
+        # Resolve aliases
+        internal_name = _TOOL_ALIASES.get(tool_name, tool_name)
+        if internal_name not in _INTERNAL_TOOLS:
+            raise HTTPException(status_code=400, detail=f"Unknown tool: {tool_name}")
+
+        # Call corresponding internal tool (sync wrapped in async)
+        func = _INTERNAL_TOOLS[internal_name]
+        result_str = func(**args)  # robust_error_handler returns JSON string
+
+        # Ensure JSON object
+        try:
+            result_json = json.loads(result_str)
+        except json.JSONDecodeError:
+            result_json = {"raw_result": result_str}
+
+        return {"result": result_json}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"MCP tool call failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Tool call failed: {e}")
 
 # Enhanced global exception handler
 @app.exception_handler(Exception)

@@ -14,7 +14,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow warnings if used
 
 # Now we can safely run the server
 if __name__ == "__main__":
-    print("🔧 Setting up environment...")
+    print(" Setting up environment...")
     print(f"   KMP_DUPLICATE_LIB_OK = {os.environ.get('KMP_DUPLICATE_LIB_OK')}")
     print(f"   MPLBACKEND = {os.environ.get('MPLBACKEND')}")
     
@@ -22,18 +22,18 @@ if __name__ == "__main__":
     from updated_mcp_server import app, load_data_and_models
     import uvicorn
     
-    print("\n🚀 Starting Enhanced Telecom KPI MCP Server...")
-    print("📊 Version 3.0 with Visualization and Governance")
+    print("\n Starting Enhanced Telecom KPI MCP Server...")
+    print(" Version 3.0 with Visualization and Governance")
     
     try:
-        print("📁 Loading data and models...")
+        print(" Loading data and models...")
         load_data_and_models()
-        print("✅ Server initialization completed!")
+        print(" Server initialization completed!")
     except Exception as e:
-        print(f"⚠️  Initialization warning: {e}")
-        print("🔄 Starting server in limited mode...")
+        print(f"  Initialization warning: {e}")
+        print(" Starting server in limited mode...")
     
-    print("\n🌐 Starting HTTP server on localhost:8000...")
+    print("\n Starting HTTP server on localhost:8000...")
     
     # Production-ready server configuration
     config = uvicorn.Config(
@@ -57,8 +57,8 @@ if __name__ == "__main__":
     try:
         server.run()
     except KeyboardInterrupt:
-        print("\n🛑 Server shutdown requested")
+        print("\n Server shutdown requested")
     except Exception as e:
-        print(f"❌ Server error: {e}")
+        print(f" Server error: {e}")
     finally:
-        print("👋 Server stopped")
+        print(" Server stopped")

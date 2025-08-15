@@ -1,52 +1,68 @@
-"""
-KPI-Specific Anomaly Detection Models
+"""Advanced KPI-specific anomaly detection models with multiple algorithms.
 
-This module implements various anomaly detection algorithms optimized for different
-types of telecom KPIs. Each KPI type gets the most suitable algorithm based on
-its characteristics.
+Implements domain-mapped primary methods per KPI including:
+ - Isolation Forest, LOF, One-Class SVM, GMM
+ - Ensemble IF+GMM
+ - Time Series Decomposition (STL / Prophet residual fallback)
+ - Seasonal Hybrid ESD (simplified generalized ESD)
+ - Feed-forward & LSTM AutoEncoders (sequence for Throughput KPIs)
 """
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Tuple, Optional, Any, Union
+from __future__ import annotations
+
+import warnings
+warnings.filterwarnings("ignore")
+
 from dataclasses import dataclass, asdict
-import pickle
-import json
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import json
+import pickle
+
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.ensemble import IsolationForest
-from sklearn.svm import OneClassSVM
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
-from scipy import stats
-import warnings
-warnings.filterwarnings('ignore')
+from sklearn.svm import OneClassSVM
+
+# Optional libs
+try:  # STL
+    from statsmodels.tsa.seasonal import STL  # type: ignore
+    STL_AVAILABLE = True
+except Exception:
+    STL_AVAILABLE = False
+
+try:  # Prophet
+    from prophet import Prophet  # type: ignore
+    PROPHET_AVAILABLE = True
+except Exception:
+    try:
+        from fbprophet import Prophet  # type: ignore
+        PROPHET_AVAILABLE = True
+    except Exception:
+        PROPHET_AVAILABLE = False
 
 from ..utils.logger import LoggerMixin, log_function_call
 from ..core.config import TelecomConfig
 
 
-def get_device():
-    """
-    Get the best available device for PyTorch operations.
-    
-    Returns:
-        torch.device: CUDA device if available, otherwise CPU
-    """
+def get_device() -> torch.device:
     if torch.cuda.is_available():
-        device = torch.device('cuda')
+        device = torch.device("cuda")
         print(f"Using GPU: {torch.cuda.get_device_name(0)}")
     else:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
         print("Using CPU for computations")
     return device
 
 
 @dataclass
 class AnomalyResult:
-    """Structured result for anomaly detection"""
     timestamp: str
     site_id: str
     sector_id: Optional[str]
@@ -56,525 +72,573 @@ class AnomalyResult:
     anomaly_score: float
     confidence: float
     method: str
-    severity: str  # 'low', 'medium', 'high'
+    severity: str
     threshold: float
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for JSON serialization"""
+
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 class AutoEncoder(nn.Module):
-    """
-    PyTorch AutoEncoder for anomaly detection with GPU support.
-    
-    Learns to reconstruct normal patterns and flags high reconstruction
-    error samples as anomalies.
-    """
-    
     def __init__(self, input_dim: int, encoding_dim: int = 32):
-        """
-        Initialize AutoEncoder.
-        
-        Args:
-            input_dim: Input feature dimension
-            encoding_dim: Encoded representation dimension
-        """
-        super(AutoEncoder, self).__init__()
-        
+        super().__init__()
         self.device = get_device()
-        
-        # Encoder
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, encoding_dim * 2),
             nn.ReLU(),
             nn.Linear(encoding_dim * 2, encoding_dim),
-            nn.ReLU()
+            nn.ReLU(),
         )
-        
-        # Decoder
         self.decoder = nn.Sequential(
             nn.Linear(encoding_dim, encoding_dim * 2),
             nn.ReLU(),
-            nn.Linear(encoding_dim * 2, input_dim)
+            nn.Linear(encoding_dim * 2, input_dim),
         )
-        
-        # Move model to device
         self.to(self.device)
-    
-    def forward(self, x):
-        """Forward pass through encoder-decoder"""
-        # Ensure input is on the correct device
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.device != self.device:
             x = x.to(self.device)
-        encoded = self.encoder(x)
-        decoded = self.decoder(encoded)
-        return decoded
+        z = self.encoder(x)
+        return self.decoder(z)
+
+
+class LSTMAutoEncoder(nn.Module):
+    def __init__(self, seq_len: int, n_features: int = 1, latent_dim: int = 32):
+        super().__init__()
+        self.seq_len = seq_len
+        self.n_features = n_features
+        self.latent_dim = latent_dim
+        self.device = get_device()
+        self.encoder = nn.LSTM(n_features, latent_dim, batch_first=True)
+        self.decoder = nn.LSTM(latent_dim, latent_dim, batch_first=True)
+        self.output_layer = nn.Linear(latent_dim, n_features)
+        self.is_lstm = True
+        self.to(self.device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.device != self.device:
+            x = x.to(self.device)
+        _, (h, _) = self.encoder(x)
+        repeat_latent = torch.repeat_interleave(h.transpose(0, 1), repeats=self.seq_len, dim=1)
+        dec_out, _ = self.decoder(repeat_latent)
+        return self.output_layer(dec_out)
 
 
 class KPISpecificDetector(LoggerMixin):
-    """
-    Individual detector for a specific KPI type.
-    
-    Automatically selects and trains the most appropriate anomaly detection
-    algorithm based on KPI characteristics.
-    """
-    
-    # KPI to algorithm mapping based on domain knowledge
-    KPI_ALGORITHM_MAP = {
-        'RSRP': 'isolation_forest',      # Signal strength - clear outliers
-        'SINR': 'autoencoder',           # Signal quality - temporal patterns
-        'DL_Throughput': 'isolation_forest',  # Performance metric - outliers
-        'UL_Throughput': 'isolation_forest',  # Performance metric - outliers
-        'CPU_Utilization': 'one_class_svm',   # Resource usage - non-linear
-        'Active_Users': 'gaussian_mixture',   # User count - multi-modal
-        'RTT': 'isolation_forest',       # Latency - clear outliers
-        'Packet_Loss': 'one_class_svm',  # Loss rate - threshold behavior
-        'Call_Drop_Rate': 'one_class_svm',    # Drop rate - threshold behavior
-        'Handover_Success_Rate': 'gaussian_mixture'  # Success rate - bimodal
+    KPI_ALGORITHM_MAP: Dict[str, str] = {
+        "RSRP": "isolation_forest",
+        "SINR": "local_outlier_factor",
+        "DL_Throughput": "autoencoder",
+        "UL_Throughput": "autoencoder",
+        "Call_Drop_Rate": "ensemble_if_gmm",
+        "RTT": "isolation_forest",
+        "CPU_Utilization": "time_series_decomposition",
+        "Active_Users": "seasonal_hybrid_esd",
+        "Packet_Loss": "one_class_svm",
+        "Handover_Success_Rate": "gaussian_mixture",
+        "Handover_Success": "gaussian_mixture",
     }
-    
+
     def __init__(self, kpi_name: str, config: TelecomConfig):
-        """
-        Initialize KPI-specific detector.
-        
-        Args:
-            kpi_name: Name of the KPI
-            config: Configuration object
-        """
         self.kpi_name = kpi_name
         self.config = config
         self.device = get_device()
-        self.algorithm = self.KPI_ALGORITHM_MAP.get(kpi_name, 'isolation_forest')
-        self.model = None
+        self.algorithm = self.KPI_ALGORITHM_MAP.get(kpi_name, "isolation_forest")
+        self.model: Any = None
         self.scaler = StandardScaler()
-        self.threshold = None
+        self.threshold: Optional[float] = None
         self.is_fitted = False
-        
-        self.logger.info(f"Initialized {self.algorithm} detector for {kpi_name} on {self.device}")
-    
-    @log_function_call
+        self.params: Dict[str, Any] = {}
+        self.feature_names: List[str] = []  # columns used during fit
+        self.logger.info(f"Initialized {self.algorithm} detector for {self.kpi_name} on {self.device}")
+
     def _create_model(self):
-        """Create the appropriate model based on algorithm choice"""
-        if self.algorithm == 'isolation_forest':
+        if self.algorithm == "isolation_forest":
             return IsolationForest(**self.config.model.isolation_forest_params)
-        
-        elif self.algorithm == 'one_class_svm':
+        if self.algorithm == "one_class_svm":
             return OneClassSVM(**self.config.model.one_class_svm_params)
-        
-        elif self.algorithm == 'gaussian_mixture':
+        if self.algorithm == "gaussian_mixture":
             return GaussianMixture(n_components=2, random_state=42)
-        
-        elif self.algorithm == 'local_outlier_factor':
-            return LocalOutlierFactor(contamination=self.config.model.contamination_rate)
-        
-        elif self.algorithm == 'autoencoder':
-            # AutoEncoder requires special handling
-            return None  # Will be created during fit
-        
-        else:
-            raise ValueError(f"Unknown algorithm: {self.algorithm}")
-    
+        if self.algorithm == "local_outlier_factor":
+            # Use novelty=True so we can score new (unseen) samples consistently in main view
+            return LocalOutlierFactor(contamination=self.config.model.contamination_rate, novelty=True)
+        if self.algorithm == "autoencoder":
+            return None
+        if self.algorithm in ["ensemble_if_gmm", "time_series_decomposition", "seasonal_hybrid_esd"]:
+            return None
+        raise ValueError(f"Unknown algorithm: {self.algorithm}")
+
     @log_function_call
-    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> 'KPISpecificDetector':
-        """
-        Train the anomaly detection model.
-        
-        Args:
-            X: Training data
-            y: Not used (unsupervised learning)
-            
-        Returns:
-            Self for method chaining
-        """
-        self.logger.info(f"Training {self.algorithm} on {X.shape[0]} samples")
-        
-        # Scale the data
-        X_scaled = self.scaler.fit_transform(X)
-        
-        if self.algorithm == 'autoencoder':
-            self._fit_autoencoder(X_scaled)
+    def fit(self, X: np.ndarray, y: Optional[np.ndarray] = None) -> "KPISpecificDetector":
+        self.logger.info(f"Training {self.algorithm} for KPI {self.kpi_name} on {X.shape[0]} samples")
+        # Store feature dimension
+        self.feature_names = [f"f{i}" for i in range(X.shape[1])]
+        # Scaling strategy
+        if self.algorithm in ["time_series_decomposition", "seasonal_hybrid_esd"]:
+            X_proc = X.astype(float)
         else:
-            # Standard sklearn-like models
+            X_proc = self.scaler.fit_transform(X)
+
+        if self.algorithm == "autoencoder":
+            seq_len = int(getattr(self.config.model, "sequence_length", 7) or 7)
+            if self.kpi_name in ["DL_Throughput", "UL_Throughput"] and seq_len > 1:
+                self._fit_lstm_autoencoder(X_proc, seq_len)
+            else:
+                self._fit_autoencoder(X_proc)
+            self._calculate_threshold(X_proc)
+        elif self.algorithm == "ensemble_if_gmm":
+            if_model = IsolationForest(**self.config.model.isolation_forest_params).fit(X_proc)
+            gmm_model = GaussianMixture(n_components=2, random_state=42).fit(X_proc)
+            self.model = {"if": if_model, "gmm": gmm_model}
+            self.is_fitted = True
+            scores = self._get_anomaly_scores(X_proc)
+            self.threshold = float(np.percentile(scores, (1 - self.config.model.contamination_rate) * 100))
+        elif self.algorithm == "time_series_decomposition":
+            series = X_proc[:, 0]
+            stl_res = None
+            if STL_AVAILABLE and len(series) >= 14:
+                try:
+                    stl_res = STL(series, period=7, robust=True).fit()
+                    resid = stl_res.resid
+                    seasonal = stl_res.seasonal
+                except Exception:
+                    stl_res = None
+            if stl_res is None:
+                trend = pd.Series(series).rolling(window=min(7, max(3, len(series)//10)), min_periods=1, center=True).mean().to_numpy()
+                resid = series - trend
+                seasonal = np.zeros_like(series)
+            model_dict: Dict[str, Any] = {
+                "res_mean": float(np.nanmean(resid)),
+                "res_std": float(np.nanstd(resid) + 1e-8),
+                "seasonal_sample": seasonal[-5000:] if len(seasonal) > 5000 else seasonal,
+                "use_stl": bool(stl_res is not None),
+            }
+            if PROPHET_AVAILABLE and len(series) >= 30:
+                try:
+                    dfp = pd.DataFrame({"ds": pd.date_range("2024-01-01", periods=len(series), freq="D"), "y": series})
+                    m = Prophet(daily_seasonality=True, weekly_seasonality=True)
+                    m.fit(dfp)
+                    fc = m.predict(dfp)
+                    resid_p = series - fc["yhat"].values
+                    model_dict["prophet_res_mean"] = float(np.nanmean(resid_p))
+                    model_dict["prophet_res_std"] = float(np.nanstd(resid_p) + 1e-8)
+                    model_dict["prophet_used"] = True
+                except Exception:
+                    model_dict["prophet_used"] = False
+            else:
+                model_dict["prophet_used"] = False
+            self.model = model_dict
+            self.threshold = 3.0
+            self.is_fitted = True
+        elif self.algorithm == "seasonal_hybrid_esd":
+            series = X_proc[:, 0]
+            period = max(3, min(7, len(series)//12 or 7))
+            seasonal = pd.Series(series).rolling(window=period, min_periods=1, center=True).median().to_numpy()
+            resid = series - seasonal
+            # Compute robust z-scores
+            res_mean = float(np.nanmean(resid))
+            res_std = float(np.nanstd(resid) + 1e-8)
+            z_scores = np.abs((resid - res_mean) / (res_std + 1e-8))
+            self.model = {
+                "seasonal_sample": seasonal[-5000:] if len(seasonal) > 5000 else seasonal,
+                "res_mean": res_mean,
+                "res_std": res_std,
+                "period": period,
+            }
+            # Threshold set by contamination rate percentile of z-scores
+            try:
+                self.threshold = float(np.percentile(z_scores, (1 - self.config.model.contamination_rate) * 100))
+            except Exception:
+                self.threshold = 3.0
+            self.is_fitted = True
+        else:  # standard model
             self.model = self._create_model()
-            self.model.fit(X_scaled)
-            self.is_fitted = True  # Set before threshold calculation
-        
-        # Calculate threshold for anomaly scoring
-        self._calculate_threshold(X_scaled)
-        
-        self.is_fitted = True  # Ensure it's set for autoencoder too
-        self.logger.info(f"Training completed for {self.kpi_name}")
-        return self
-    
-    def _fit_autoencoder(self, X: np.ndarray):
-        """Train AutoEncoder model with GPU support"""
-        input_dim = X.shape[1]
-        encoding_dim = min(self.config.model.autoencoder_params['encoding_dim'], input_dim // 2)
-        
-        self.model = AutoEncoder(input_dim, encoding_dim)
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(
-            self.model.parameters(),
-            lr=self.config.model.autoencoder_params['learning_rate']
-        )
-        
-        # Convert to tensor and move to device
-        X_tensor = torch.FloatTensor(X).to(self.device)
-        
-        # Training loop
-        self.model.train()
-        epochs = self.config.model.autoencoder_params['epochs']
-        
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            reconstructed = self.model(X_tensor)
-            loss = criterion(reconstructed, X_tensor)
-            loss.backward()
-            optimizer.step()
-            
-            if (epoch + 1) % 10 == 0:
-                self.logger.debug(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.6f}")
-        
-        # Set fitted after training
+            if self.model is not None:
+                self.model.fit(X_proc)
+                self.is_fitted = True
+                self._calculate_threshold(X_proc)
+
         self.is_fitted = True
-    
+        return self
+
+    def set_feature_names(self, names: List[str]):
+        self.feature_names = list(names)
+
+    def get_diagnostics(self, X_raw: np.ndarray) -> Dict[str, Any]:
+        """Return diagnostic statistics for current detector on given raw feature matrix (same order as training).
+
+        Safe to call with single-column input; it will adapt like predict().
+        """
+        if not self.is_fitted:
+            return {"error": "not_fitted"}
+        try:
+            if self.algorithm in ["time_series_decomposition", "seasonal_hybrid_esd"]:
+                X_proc = X_raw.astype(float)
+            else:
+                # Re-use robust adaptation logic
+                expected_dim = int(getattr(self.scaler, 'mean_', np.array([0])).shape[0])
+                X_in = X_raw
+                if X_in.shape[1] != expected_dim and expected_dim > 0:
+                    if X_in.shape[1] == 1:
+                        X_in = np.repeat(X_in, expected_dim, axis=1)
+                    elif X_in.shape[1] > expected_dim:
+                        X_in = X_in[:, :expected_dim]
+                    else:
+                        pad = expected_dim - X_in.shape[1]
+                        X_in = np.hstack([X_in, np.zeros((X_in.shape[0], pad))])
+                X_proc = self.scaler.transform(X_in)
+            scores = self._get_anomaly_scores(X_proc)
+            return {
+                "algorithm": self.algorithm,
+                "threshold": float(self.threshold) if self.threshold is not None else None,
+                "score_min": float(np.min(scores)),
+                "score_median": float(np.median(scores)),
+                "score_mean": float(np.mean(scores)),
+                "score_max": float(np.max(scores)),
+                "num_flagged": int(np.sum(scores > (self.threshold if self.threshold is not None else np.inf))),
+                "total": int(len(scores)),
+                "feature_dim_trained": int(getattr(self.scaler, 'mean_', np.array([0])).shape[0]) if self.algorithm not in ["time_series_decomposition", "seasonal_hybrid_esd"] else 1,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    def _fit_autoencoder(self, X: np.ndarray):
+        input_dim = X.shape[1]
+        enc_dim = min(self.config.model.autoencoder_params["encoding_dim"], max(4, input_dim // 2))
+        self.model = AutoEncoder(input_dim, enc_dim)
+        crit = nn.MSELoss()
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.config.model.autoencoder_params["learning_rate"])
+        X_t = torch.FloatTensor(X).to(self.model.device)
+        epochs = self.config.model.autoencoder_params["epochs"]
+        self.model.train()
+        for ep in range(epochs):
+            opt.zero_grad()
+            rec = self.model(X_t)
+            loss = crit(rec, X_t)
+            loss.backward()
+            opt.step()
+            if (ep + 1) % 10 == 0:
+                self.logger.debug(f"AE Epoch {ep+1}/{epochs} loss {loss.item():.6f}")
+        self.is_fitted = True
+
+    def _fit_lstm_autoencoder(self, X: np.ndarray, seq_len: int = 7):
+        values = X[:, 0]
+        if len(values) <= seq_len:
+            self._fit_autoencoder(X)
+            return
+        windows = np.array([values[i:i+seq_len] for i in range(len(values) - seq_len + 1)])
+        windows = windows.reshape(-1, seq_len, 1)
+        model = LSTMAutoEncoder(seq_len=seq_len, n_features=1, latent_dim=min(64, max(8, seq_len * 2)))
+        crit = nn.MSELoss()
+        opt = torch.optim.Adam(model.parameters(), lr=self.config.model.autoencoder_params["learning_rate"])
+        X_t = torch.FloatTensor(windows).to(model.device)
+        epochs = self.config.model.autoencoder_params["epochs"]
+        model.train()
+        for ep in range(epochs):
+            opt.zero_grad()
+            rec = model(X_t)
+            loss = crit(rec, X_t)
+            loss.backward()
+            opt.step()
+            if (ep + 1) % 10 == 0:
+                self.logger.debug(f"LSTM AE Epoch {ep+1}/{epochs} loss {loss.item():.6f}")
+        self.model = model
+        self.is_fitted = True
+
     def _calculate_threshold(self, X: np.ndarray):
-        """Calculate threshold for anomaly detection"""
         scores = self._get_anomaly_scores(X)
-        
-        if self.algorithm in ['isolation_forest', 'one_class_svm']:
-            # For these algorithms, -1 indicates anomaly, 1 indicates normal
-            # We'll use the contamination rate to set threshold
-            self.threshold = np.percentile(scores, (1 - self.config.model.contamination_rate) * 100)
+        if self.algorithm in ["isolation_forest", "one_class_svm"]:
+            self.threshold = float(np.percentile(scores, (1 - self.config.model.contamination_rate) * 100))
         else:
-            # For other algorithms, use statistical threshold
-            self.threshold = np.mean(scores) + 2 * np.std(scores)
-    
+            self.threshold = float(np.mean(scores) + 2 * np.std(scores))
+
     def _get_anomaly_scores(self, X: np.ndarray) -> np.ndarray:
-        """Get anomaly scores for samples"""
         if not self.is_fitted:
             raise ValueError("Model not fitted yet")
-        
-        if self.algorithm == 'autoencoder':
-            self.model.eval()
-            with torch.no_grad():
-                X_tensor = torch.FloatTensor(X).to(self.device)
-                reconstructed = self.model(X_tensor)
-                scores = torch.mean((X_tensor - reconstructed) ** 2, dim=1).cpu().numpy()
-        
-        elif self.algorithm == 'isolation_forest':
-            scores = -self.model.score_samples(X)  # Negative for consistency
-        
-        elif self.algorithm == 'one_class_svm':
-            scores = -self.model.score_samples(X)  # Negative for consistency
-        
-        elif self.algorithm == 'gaussian_mixture':
-            scores = -self.model.score_samples(X)  # Negative log-likelihood
-        
-        elif self.algorithm == 'local_outlier_factor':
-            scores = -self.model.negative_outlier_factor_
-        
-        else:
-            raise ValueError(f"Unknown algorithm: {self.algorithm}")
-        
-        return scores
-    
+        if self.algorithm == "autoencoder":
+            if hasattr(self.model, "is_lstm") and getattr(self.model, "is_lstm"):
+                seq_len = self.model.seq_len
+                vals = X[:, 0]
+                if len(vals) <= seq_len:
+                    pads = np.pad(vals, (seq_len - len(vals) + 1, 0), mode="edge")
+                    vals = pads
+                wins = np.array([vals[i:i+seq_len] for i in range(len(vals) - seq_len + 1)]).reshape(-1, seq_len, 1)
+                self.model.eval()
+                with torch.no_grad():
+                    t = torch.FloatTensor(wins).to(self.model.device)
+                    rec = self.model(t)
+                    w_scores = torch.mean((t - rec) ** 2, dim=(1, 2)).cpu().numpy()
+                scores = np.zeros(len(vals))
+                for i, s in enumerate(w_scores):
+                    scores[i + seq_len - 1] = s
+                return scores[-len(X):]
+            else:
+                self.model.eval()
+                with torch.no_grad():
+                    t = torch.FloatTensor(X).to(self.model.device)
+                    rec = self.model(t)
+                    return torch.mean((t - rec) ** 2, dim=1).cpu().numpy()
+        if self.algorithm == "isolation_forest":
+            return -self.model.score_samples(X)
+        if self.algorithm == "one_class_svm":
+            return -self.model.score_samples(X)
+        if self.algorithm == "gaussian_mixture":
+            return -self.model.score_samples(X)
+        if self.algorithm == "local_outlier_factor":
+            # Prefer score_samples when novelty=True; fallback to fitted training factors
+            if hasattr(self.model, "score_samples"):
+                return -self.model.score_samples(X)
+            return -getattr(self.model, "negative_outlier_factor_", np.zeros(len(X)))
+        if self.algorithm == "ensemble_if_gmm":
+            if_scores = -self.model["if"].score_samples(X)
+            gmm_scores = -self.model["gmm"].score_samples(X)
+            # Allow tuned weight customization (default 0.5/0.5)
+            w_if, w_gmm = self.model.get("weights", (0.5, 0.5))
+            total_w = (w_if + w_gmm) or 1.0
+            w_if /= total_w
+            w_gmm /= total_w
+            def _norm(s):
+                rng = np.max(s) - np.min(s) + 1e-8
+                return (s - np.min(s)) / rng
+            return w_if * _norm(if_scores) + w_gmm * _norm(gmm_scores)
+        if self.algorithm == "time_series_decomposition":
+            series = X[:, 0]
+            trend = pd.Series(series).rolling(window=7, min_periods=1, center=True).mean().to_numpy()
+            resid = series - trend
+            mean_r = self.model.get("prophet_res_mean", self.model["res_mean"])
+            std_r = self.model.get("prophet_res_std", self.model["res_std"])
+            return np.abs(resid - mean_r) / (std_r + 1e-8)
+        if self.algorithm == "seasonal_hybrid_esd":
+            series = X[:, 0]
+            period = self.model["period"]
+            seasonal = pd.Series(series).rolling(window=period, min_periods=1, center=True).median().to_numpy()
+            resid = series - seasonal
+            return np.abs(resid - self.model["res_mean"]) / (self.model["res_std"] + 1e-8)
+        raise ValueError(f"Unknown algorithm: {self.algorithm}")
+
     @log_function_call
     def predict(self, X: np.ndarray) -> List[AnomalyResult]:
-        """
-        Predict anomalies in new data.
-        
-        Args:
-            X: Input data
-            
-        Returns:
-            List of AnomalyResult objects
-        """
         if not self.is_fitted:
             raise ValueError("Model not fitted yet")
-        
-        # Scale the data
-        X_scaled = self.scaler.transform(X)
-        
-        # Get anomaly scores
-        scores = self._get_anomaly_scores(X_scaled)
-        
-        # Determine anomalies
-        is_anomaly = scores > self.threshold
-        
-        # Create results
-        results = []
-        for i, (score, anomaly) in enumerate(zip(scores, is_anomaly)):
-            # Calculate confidence and severity
-            confidence = min(abs(score - self.threshold) / (self.threshold + 1e-8), 1.0)
-            
-            if anomaly:
-                if score > self.threshold * 2:
-                    severity = 'high'
-                elif score > self.threshold * 1.5:
-                    severity = 'medium'
+        # --- Feature dimension robustness ---
+        # Saved scaler may expect more features than current runtime slice provides (e.g. model was
+        # trained with engineered/augmented columns; now only raw KPI column passed). Instead of
+        # failing, adapt the input so monitoring / UI can still render anomalies.
+        X_in = X
+        if self.algorithm not in ["time_series_decomposition", "seasonal_hybrid_esd"]:
+            try:
+                expected_dim = int(getattr(self.scaler, 'mean_', np.array([0])).shape[0])
+                if X_in.shape[1] != expected_dim:
+                    if X_in.shape[1] == 1 and expected_dim > 1:
+                        # Repeat the single feature across expected dimensions (information duplication)
+                        X_in = np.repeat(X_in, expected_dim, axis=1)
+                    elif X_in.shape[1] > expected_dim:
+                        # Truncate extra features (keep first expected_dim)
+                        X_in = X_in[:, :expected_dim]
+                    else:  # fewer features but not single -> pad with zeros
+                        pad_cols = expected_dim - X_in.shape[1]
+                        X_in = np.hstack([X_in, np.zeros((X_in.shape[0], pad_cols))])
+            except Exception:
+                pass
+        # Scaling / passthrough
+        if self.algorithm in ["time_series_decomposition", "seasonal_hybrid_esd"]:
+            X_proc = X_in.astype(float)
+        else:
+            try:
+                X_proc = self.scaler.transform(X_in)
+            except Exception:
+                # As a last resort, refit scaler on current shape (logs may warn threshold drift)
+                try:
+                    self.scaler.fit(X_in)
+                    X_proc = self.scaler.transform(X_in)
+                except Exception:
+                    X_proc = X_in.astype(float)
+        scores = self._get_anomaly_scores(X_proc)
+        is_anom = scores > self.threshold
+        results: List[AnomalyResult] = []
+        for i, (sc, an) in enumerate(zip(scores, is_anom)):
+            conf = float(min(abs(sc - self.threshold) / (self.threshold + 1e-8), 1.0))
+            if an:
+                if sc > self.threshold * 2:
+                    sev = "high"
+                elif sc > self.threshold * 1.5:
+                    sev = "medium"
                 else:
-                    severity = 'low'
+                    sev = "low"
             else:
-                severity = 'normal'
-            
-            result = AnomalyResult(
-                timestamp=f"sample_{i}",  # Will be updated with actual timestamp
-                site_id="unknown",        # Will be updated with actual site
-                sector_id=None,
-                kpi_name=self.kpi_name,
-                value=float(X[i, 0]) if X.shape[1] > 0 else 0.0,
-                is_anomaly=bool(anomaly),
-                anomaly_score=float(score),
-                confidence=float(confidence),
-                method=self.algorithm,
-                severity=severity,
-                threshold=float(self.threshold)
+                sev = "normal"
+            results.append(
+                AnomalyResult(
+                    timestamp=f"sample_{i}",
+                    site_id="unknown",
+                    sector_id=None,
+                    kpi_name=self.kpi_name,
+                    value=float(X[i, 0]) if X.shape[1] else 0.0,
+                    is_anomaly=bool(an),
+                    anomaly_score=float(sc),
+                    confidence=conf,
+                    method=self.algorithm,
+                    severity=sev,
+                    threshold=float(self.threshold),
+                )
             )
-            results.append(result)
-        
         return results
-    
+
     def save_model(self, filepath: str):
-        """Save trained model to disk"""
         if not self.is_fitted:
             raise ValueError("Cannot save unfitted model")
-        
-        model_data = {
-            'kpi_name': self.kpi_name,
-            'algorithm': self.algorithm,
-            'threshold': self.threshold,
-            'scaler': self.scaler
+        data: Dict[str, Any] = {
+            "kpi_name": self.kpi_name,
+            "algorithm": self.algorithm,
+            "threshold": self.threshold,
+            "scaler": self.scaler,
+            "params": self.params,
+            "feature_names": self.feature_names,
         }
-        
-        if self.algorithm == 'autoencoder':
-            # Save PyTorch model state
-            model_data['model_state'] = self.model.state_dict()
-            model_data['input_dim'] = self.model.encoder[0].in_features
-            model_data['encoding_dim'] = self.model.encoder[2].in_features
+        if self.algorithm == "autoencoder":
+            if hasattr(self.model, "is_lstm") and getattr(self.model, "is_lstm"):
+                data.update({
+                    "model_state": self.model.state_dict(),
+                    "lstm": True,
+                    "seq_len": int(self.model.seq_len),
+                    "latent_dim": int(self.model.latent_dim),
+                })
+            else:
+                data.update({
+                    "model_state": self.model.state_dict(),
+                    "input_dim": int(self.model.encoder[0].in_features),
+                    "encoding_dim": int(self.model.encoder[2].out_features),
+                })
         else:
-            model_data['model'] = self.model
-        
-        with open(filepath, 'wb') as f:
-            pickle.dump(model_data, f)
-        
-        self.logger.info(f"Model saved to {filepath}")
-    
+            data["model"] = self.model
+        with open(filepath, "wb") as f:
+            pickle.dump(data, f)
+        self.logger.info(f"Saved {self.kpi_name} model to {filepath}")
+
     def load_model(self, filepath: str):
-        """Load trained model from disk"""
-        with open(filepath, 'rb') as f:
-            model_data = pickle.load(f)
-        
-        self.kpi_name = model_data['kpi_name']
-        self.algorithm = model_data['algorithm']
-        self.threshold = model_data['threshold']
-        self.scaler = model_data['scaler']
-        
-        if self.algorithm == 'autoencoder':
-            # Reconstruct PyTorch model
-            input_dim = model_data['input_dim']
-            encoding_dim = model_data['encoding_dim']
-            self.model = AutoEncoder(input_dim, encoding_dim)
-            self.model.load_state_dict(model_data['model_state'])
-            self.model.to(self.device)  # Move to appropriate device
-            self.model.eval()
+        with open(filepath, "rb") as f:
+            data = pickle.load(f)
+        self.kpi_name = data["kpi_name"]
+        self.algorithm = data["algorithm"]
+        self.threshold = data["threshold"]
+        self.scaler = data["scaler"]
+        self.params = data.get("params", {})
+        self.feature_names = data.get("feature_names", [])
+        if self.algorithm == "autoencoder":
+            state = data.get("model_state")
+            if data.get("lstm"):
+                seq_len = int(data.get("seq_len", 7))
+                latent_dim = int(data.get("latent_dim", 32))
+                model = LSTMAutoEncoder(seq_len=seq_len, n_features=1, latent_dim=latent_dim)
+                model.load_state_dict(state)
+                model.to(self.device)
+                model.eval()
+                self.model = model
+            else:
+                try:
+                    enc0_w = state["encoder.0.weight"]
+                    enc2_w = state["encoder.2.weight"]
+                    in_dim = int(enc0_w.shape[1])
+                    enc_dim = int(enc2_w.shape[0])
+                except Exception:
+                    in_dim = int(data.get("input_dim"))
+                    enc_dim = int(data.get("encoding_dim"))
+                model = AutoEncoder(in_dim, enc_dim)
+                model.load_state_dict(state)
+                model.to(self.device)
+                model.eval()
+                self.model = model
         else:
-            self.model = model_data['model']
-        
+            self.model = data["model"]
         self.is_fitted = True
-        self.logger.info(f"Model loaded from {filepath}")
+        self.logger.info(f"Loaded {self.kpi_name} model from {filepath}")
 
 
 class KPIAnomalyDetector(LoggerMixin):
-    """
-    Main anomaly detector that manages multiple KPI-specific detectors.
-    
-    This class orchestrates training and inference across all KPIs,
-    providing a unified interface for anomaly detection.
-    """
-    
     def __init__(self, config: TelecomConfig):
-        """
-        Initialize the multi-KPI anomaly detector.
-        
-        Args:
-            config: Configuration object
-        """
         self.config = config
         self.device = get_device()
         self.detectors: Dict[str, KPISpecificDetector] = {}
         self.is_fitted = False
         self.logger.info(f"Initialized KPIAnomalyDetector on {self.device}")
-    
+
     @log_function_call
-    def fit(self, data: pd.DataFrame) -> 'KPIAnomalyDetector':
-        """
-        Train anomaly detectors for all KPIs.
-        
-        Args:
-            data: Processed DataFrame with KPI data
-            
-        Returns:
-            Self for method chaining
-        """
-        self.logger.info("Starting training for all KPI detectors")
-        
-        available_kpis = [kpi for kpi in self.config.data.kpi_columns if kpi in data.columns]
-        
-        for kpi in available_kpis:
-            self.logger.info(f"Training detector for {kpi}")
-            
-            # Extract KPI data (and related features)
-            kpi_features = [col for col in data.columns if kpi in col and data[col].dtype in ['int64', 'float64']]
-            if not kpi_features:
-                kpi_features = [kpi]  # Fallback to just the KPI itself
-            
-            X = data[kpi_features].values
-            
-            # Create and train detector
-            detector = KPISpecificDetector(kpi, self.config)
-            detector.fit(X)
-            self.detectors[kpi] = detector
-        
+    def fit(self, data: pd.DataFrame) -> "KPIAnomalyDetector":
+        self.logger.info("Training detectors for all KPIs")
+        available = [k for k in self.config.data.kpi_columns if k in data.columns]
+        for kpi in available:
+            self.logger.info(f"Training {kpi}")
+            feat_cols = [c for c in data.columns if c == kpi or (kpi in c and data[c].dtype in ["int64", "float64"])]
+            if not feat_cols:
+                feat_cols = [kpi]
+            X = data[feat_cols].values
+            det = KPISpecificDetector(kpi, self.config).fit(X)
+            self.detectors[kpi] = det
         self.is_fitted = True
-        self.logger.info(f"Training completed for {len(self.detectors)} KPI detectors")
         return self
-    
+
     @log_function_call
-    def detect_anomalies(
-        self,
-        data: pd.DataFrame,
-        kpi_name: Optional[str] = None,
-        site_id: Optional[str] = None,
-        date_range: Optional[Tuple[str, str]] = None
-    ) -> List[AnomalyResult]:
-        """
-        Detect anomalies in the provided data.
-        
-        Args:
-            data: Input DataFrame
-            kpi_name: Optional specific KPI to analyze
-            site_id: Optional specific site to analyze
-            date_range: Optional date range tuple (start, end)
-            
-        Returns:
-            List of anomaly results
-        """
+    def detect_anomalies(self, data: pd.DataFrame, kpi_name: Optional[str] = None, site_id: Optional[str] = None, date_range: Optional[Tuple[str, str]] = None) -> List[AnomalyResult]:
         if not self.is_fitted:
             raise ValueError("Detectors not fitted yet")
-        
-        # Filter data if needed
-        filtered_data = data.copy()
-        
-        if site_id and 'Site_ID' in filtered_data.columns:
-            filtered_data = filtered_data[filtered_data['Site_ID'] == site_id]
-        
-        if date_range and 'Date' in filtered_data.columns:
-            start_date, end_date = date_range
-            filtered_data = filtered_data[
-                (filtered_data['Date'] >= start_date) & (filtered_data['Date'] <= end_date)
-            ]
-        
-        # Determine which KPIs to analyze
-        kpis_to_analyze = [kpi_name] if kpi_name else list(self.detectors.keys())
-        kpis_to_analyze = [kpi for kpi in kpis_to_analyze if kpi in filtered_data.columns]
-        
-        all_results = []
-        
-        for kpi in kpis_to_analyze:
-            detector = self.detectors[kpi]
-            
-            # Prepare data for this KPI
-            kpi_features = [col for col in filtered_data.columns if kpi in col and filtered_data[col].dtype in ['int64', 'float64']]
-            if not kpi_features:
-                kpi_features = [kpi]
-            
-            X = filtered_data[kpi_features].values
-            
+        df = data.copy()
+        if site_id and "Site_ID" in df.columns:
+            df = df[df["Site_ID"] == site_id]
+        if date_range and "Date" in df.columns:
+            start, end = date_range
+            df = df[(df["Date"] >= start) & (df["Date"] <= end)]
+        target_kpis = [kpi_name] if kpi_name else list(self.detectors.keys())
+        target_kpis = [k for k in target_kpis if k in df.columns]
+        all_results: List[AnomalyResult] = []
+        for kpi in target_kpis:
+            det = self.detectors[kpi]
+            feat_cols = [c for c in df.columns if c == kpi or (kpi in c and df[c].dtype in ["int64", "float64"])]
+            if not feat_cols:
+                feat_cols = [kpi]
+            X = df[feat_cols].fillna(0.0).values
             if len(X) == 0:
                 continue
-            
-            # Get predictions
-            results = detector.predict(X)
-            
-            # Update results with actual metadata
-            for i, result in enumerate(results):
-                row = filtered_data.iloc[i]
-                result.timestamp = str(row.get('Date', f'row_{i}'))
-                result.site_id = str(row.get('Site_ID', 'unknown'))
-                result.sector_id = str(row.get('Sector_ID', None)) if 'Sector_ID' in row else None
-                result.value = float(row[kpi])
-            
+            results = det.predict(X)
+            for i, res in enumerate(results):
+                row = df.iloc[i]
+                res.timestamp = str(row.get("Date", f"row_{i}"))
+                res.site_id = str(row.get("Site_ID", "unknown"))
+                res.sector_id = str(row.get("Sector_ID", None)) if "Sector_ID" in row else None
+                res.value = float(row[kpi])
             all_results.extend(results)
-        
-        # Sort results by anomaly score (highest first)
-        all_results.sort(key=lambda x: x.anomaly_score, reverse=True)
-        
-        self.logger.info(f"Detected {sum(1 for r in all_results if r.is_anomaly)} anomalies out of {len(all_results)} samples")
-        
+        all_results.sort(key=lambda r: r.anomaly_score, reverse=True)
+        self.logger.info(f"Detected {sum(1 for r in all_results if r.is_anomaly)} anomalies across {len(all_results)} samples")
         return all_results
-    
-    def get_model_summary(self) -> Dict:
-        """Get summary of all trained models"""
+
+    def get_model_summary(self) -> Dict[str, Any]:
         if not self.is_fitted:
             return {"error": "Models not fitted yet"}
-        
-        summary = {}
-        for kpi, detector in self.detectors.items():
-            summary[kpi] = {
-                'algorithm': detector.algorithm,
-                'threshold': float(detector.threshold),
-                'is_fitted': detector.is_fitted
-            }
-        
-        return summary
-    
+        return {k: {"algorithm": d.algorithm, "threshold": float(d.threshold), "is_fitted": d.is_fitted} for k, d in self.detectors.items()}
+
     def save_all_models(self, models_dir: Optional[str] = None):
-        """Save all trained models"""
         if not self.is_fitted:
             raise ValueError("Cannot save unfitted models")
-        
-        if models_dir is None:
-            models_dir = self.config.models_dir
-        
-        models_dir = Path(models_dir)
+        models_dir = Path(models_dir or self.config.models_dir)
         models_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save individual detectors
-        for kpi, detector in self.detectors.items():
-            filepath = models_dir / f"{kpi}_detector.pkl"
-            detector.save_model(str(filepath))
-        
-        # Save master configuration
-        config_path = models_dir / "detectors_config.json"
-        with open(config_path, 'w') as f:
+        for k, det in self.detectors.items():
+            det.save_model(str(models_dir / f"{k}_detector.pkl"))
+        with open(models_dir / "detectors_config.json", "w") as f:
             json.dump(self.get_model_summary(), f, indent=2)
-        
-        self.logger.info(f"All models saved to {models_dir}")
-    
+        self.logger.info(f"Saved all detector models to {models_dir}")
+
     def load_all_models(self, models_dir: Optional[str] = None):
-        """Load all trained models"""
-        if models_dir is None:
-            models_dir = self.config.models_dir
-        
-        models_dir = Path(models_dir)
-        
-        # Load master configuration
-        config_path = models_dir / "detectors_config.json"
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                model_config = json.load(f)
-        else:
-            model_config = {}
-        
-        # Load individual detectors
-        for kpi in self.config.data.kpi_columns:
-            filepath = models_dir / f"{kpi}_detector.pkl"
-            if filepath.exists():
-                detector = KPISpecificDetector(kpi, self.config)
-                detector.load_model(str(filepath))
-                self.detectors[kpi] = detector
-        
-        self.is_fitted = len(self.detectors) > 0
-        self.logger.info(f"Loaded {len(self.detectors)} model detectors")
+        models_dir = Path(models_dir or self.config.models_dir)
+        loaded = 0
+        for k in self.config.data.kpi_columns:
+            fp = models_dir / f"{k}_detector.pkl"
+            if fp.exists():
+                try:
+                    det = KPISpecificDetector(k, self.config)
+                    det.load_model(str(fp))
+                    self.detectors[k] = det
+                    loaded += 1
+                except Exception as e:
+                    self.logger.warning(f"Failed loading {k}: {e}")
+        self.is_fitted = loaded > 0
+        self.logger.info(f"Loaded {loaded} model detectors")

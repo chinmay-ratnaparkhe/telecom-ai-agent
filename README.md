@@ -31,6 +31,7 @@ This platform combines advanced machine learning with conversational AI to provi
 - **Interactive charts** and real-time dashboards
 - **Multi-site comparison** tools
 - **Exportable reports** and insights
+- **Robust CSV upload**: Uploads are now handled directly as DataFrames, making the platform compatible with both file paths and in-memory data.
 
 ## Architecture
 
@@ -63,34 +64,36 @@ This platform combines advanced machine learning with conversational AI to provi
 ### Installation
 
 1. **Clone the repository**
-`Bash
-git clone https://github.com/yourusername/telecom-ai-agent.git
+git clone https://github.com/chinmay-ratnaparkhe/telecom-ai-agent.git
 cd telecom-ai-agent
-`
+```bash
+git clone https://github.com/chinmay-ratnaparkhe/telecom-ai-agent.git
+cd telecom-ai-agent
+```
 
 2. **Install dependencies**
-`Bash
 pip install -r requirements.txt
-`
+```bash
+pip install -r requirements.txt
+```
 
 3. **Set up environment variables**
-`Bash
+```bash
 # Copy and configure environment file
 cp .env.example .env
-# Add your Google API key and other configurations
-`
+# Add your Google Gemini API key and other configurations to .env
+```
 
 4. **Start the MCP server**
-`Bash
+```bash
 cd mcp_server
 python updated_mcp_server.py
-`
+```
 
 5. **Launch the application**
-`Bash
-cd src/telecom_ai_platform
-streamlit run ui/streamlit_app.py
-`
+```bash
+streamlit run streamlit_ui/app.py
+```
 
 ## Usage Examples
 

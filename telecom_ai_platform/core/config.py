@@ -45,6 +45,9 @@ class ModelConfig:
         'gamma': 'scale'
     })
 
+    # Sequence modeling (LSTM AE) default window length
+    sequence_length: int = 7
+
 
 @dataclass
 class AIAgentConfig:

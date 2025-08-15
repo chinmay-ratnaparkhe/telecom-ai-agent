@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive REAL DATA Testing Script for Telecom AI Platform
+REAL DATA Testing Script for Telecom AI Platform
 
 This script tests the complete functionality using REAL data and REAL APIs:
 1. Tests with actual AD_data_10KPI.csv file

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive Test Script for GPU-Enabled Telecom AI Platform
+Test Script for GPU-Enabled Telecom AI Platform
 
 This script tests the complete functionality including:
 1. GPU detection and support

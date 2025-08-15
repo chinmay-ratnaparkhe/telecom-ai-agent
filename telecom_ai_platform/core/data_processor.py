@@ -63,18 +63,34 @@ class TelecomDataProcessor(LoggerMixin):
         self.logger.info(f"Loading data from {data_path}")
         
         try:
-            df = pd.read_csv(data_path)
+            # Try reading with different encodings and parameters
+            df = pd.read_csv(data_path, encoding='utf-8')
+            
+            # If that fails, try other common encodings
+            if df.empty or len(df.columns) == 0:
+                try:
+                    df = pd.read_csv(data_path, encoding='latin-1')
+                except:
+                    df = pd.read_csv(data_path, encoding='cp1252')
+            
             self.logger.info(f"Loaded {len(df)} rows with {len(df.columns)} columns")
+            self.logger.info(f"Columns: {list(df.columns)}")
             
             # Basic validation
             if df.empty:
                 raise pd.errors.EmptyDataError("Loaded data is empty")
             
+            if len(df.columns) == 0:
+                raise ValueError("No columns found in CSV file")
+            
             self.original_data = df.copy()
             return df
             
         except Exception as e:
-            self.logger.error(f"Failed to load data: {e}")
+            self.logger.error(f"Failed to load data from {data_path}: {e}")
+            self.logger.error(f"File exists: {data_path.exists()}")
+            if data_path.exists():
+                self.logger.error(f"File size: {data_path.stat().st_size} bytes")
             raise
     
     @log_function_call
@@ -288,20 +304,24 @@ class TelecomDataProcessor(LoggerMixin):
         }
     
     @log_function_call
-    def process_pipeline(self, data_path: Optional[str] = None) -> pd.DataFrame:
+    def process_pipeline(self, data: Optional[Union[str, Path, pd.DataFrame]] = None) -> pd.DataFrame:
         """
         Run the complete data processing pipeline.
         
         Args:
-            data_path: Optional path to data file
+            data: Optional path to data file or a DataFrame
             
         Returns:
             Fully processed DataFrame ready for model training
         """
         self.logger.info("Starting complete data processing pipeline")
         
-        # Load data
-        df = self.load_data(data_path)
+        if isinstance(data, (str, Path)) or data is None:
+            df = self.load_data(data)
+        elif isinstance(data, pd.DataFrame):
+            df = data.copy()
+        else:
+            raise ValueError("Input to process_pipeline must be a file path, Path, or DataFrame")
         
         # Clean data
         df = self.clean_data(df)
