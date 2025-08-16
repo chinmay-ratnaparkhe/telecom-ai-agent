@@ -795,14 +795,14 @@ Focus specifically on this step's objective. Be analytical and precise.
             step_summaries.append(summary)
         # If we have concrete anomaly evidence (top KPI), include it as factual context
         factual_block = ""
+        anomaly_summary = None  # capture structured anomaly facts for post-processing
         try:
             for step in reasoning_chain:
                 if step.evidence and 'anomaly_summary' in step.evidence:
                     a = step.evidence['anomaly_summary']
                     if a.get('by_kpi'):
-                        factual_block = json.dumps({
-                            'anomaly_facts': a
-                        }, indent=2)
+                        factual_block = json.dumps({'anomaly_facts': a}, indent=2)
+                        anomaly_summary = a
                         break
         except Exception:
             pass
@@ -828,13 +828,31 @@ Keep the conclusion focused and professional.
 """
         
         try:
-            return await asyncio.get_event_loop().run_in_executor(
+            generated = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self._gemini_generate_text(
                     user_text=synthesis_prompt,
                     system_text="You summarize findings for a telecom analysis.",
                 ),
             )
+            # Post-process to guarantee explicit anomaly count mention
+            if anomaly_summary and isinstance(generated, str):
+                try:
+                    total = anomaly_summary.get('total_anomalies') or anomaly_summary.get('total')
+                    if total is not None:
+                        lowered = generated.lower()
+                        if 'detected anomalies' not in lowered and 'anomalies detected' not in lowered:
+                            top_kpi = anomaly_summary.get('top_kpi')
+                            method = anomaly_summary.get('method', anomaly_summary.get('source', 'model'))
+                            extra = f"\nDetected anomalies: {total}"
+                            if top_kpi:
+                                extra += f" (top KPI: {top_kpi})"
+                            if method:
+                                extra += f" [source: {method}]"
+                            generated = generated.rstrip() + "\n" + extra
+                except Exception:
+                    pass
+            return generated
         except Exception as e:
             return f"Error synthesizing conclusion: {str(e)}"
 

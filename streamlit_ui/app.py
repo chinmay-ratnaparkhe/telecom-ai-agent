@@ -46,9 +46,30 @@ DETECTOR_AVAILABLE = False
 try:
     from telecom_ai_platform.core.config import TelecomConfig as _Cfg
     from telecom_ai_platform.models.anomaly_detector import KPIAnomalyDetector, KPISpecificDetector
+    # General cross-KPI autoencoder (optional)
+    from telecom_ai_platform.models.enhanced_autoencoder import GeneralAutoEncoderDetector
     DETECTOR_AVAILABLE = True
 except Exception:
     DETECTOR_AVAILABLE = False
+    GeneralAutoEncoderDetector = None  # type: ignore
+
+    from typing import TYPE_CHECKING
+    if TYPE_CHECKING:  # static type checking only
+        from telecom_ai_platform.models.enhanced_autoencoder import GeneralAutoEncoderDetector
+
+# Domain-based default anomaly direction per KPI (high values bad vs low values bad vs both)
+KPI_DEFAULT_DIRECTION = {
+    'Packet_Loss': 'high',
+    'Call_Drop_Rate': 'high',
+    'CPU_Utilization': 'high',
+    'RTT': 'high',
+    'Active_Users': 'both',
+    'DL_Throughput': 'low',  # unusually low throughput typically problematic
+    'UL_Throughput': 'low',
+    'RSRP': 'low',           # low signal power
+    'SINR': 'low',           # low SINR harmful
+    'Handover_Success_Rate': 'low',
+}
 
 
 # ---------- Page config ----------
@@ -118,6 +139,86 @@ def get_ui_detector() -> Optional["KPIAnomalyDetector"]:
     return ui_detector
 
 
+from typing import Any as _Any  # alias to avoid confusion
+
+@st.cache_resource(show_spinner=False)
+def load_general_autoencoder(model_path: Optional[str] = None) -> Optional[_Any]:
+    """Load a pre-trained general autoencoder (if available) for cross-KPI reconstruction error analysis.
+
+    Looks for 'general_autoencoder.pkl' under the configured models directory unless an explicit path is provided.
+    Returns None if not found or on failure (silent)."""
+    if not DETECTOR_AVAILABLE:
+        return None
+    try:
+        cfg = _Cfg()
+        if model_path is None:
+            candidate = os.path.join(cfg.models_dir, 'general_autoencoder.pkl')
+        else:
+            candidate = model_path
+        if not os.path.exists(candidate):
+            return None
+        # Ensure class is available; attempt lazy import if previously failed
+        global GeneralAutoEncoderDetector
+        if GeneralAutoEncoderDetector is None:
+            try:
+                from telecom_ai_platform.models.enhanced_autoencoder import GeneralAutoEncoderDetector as _GAE
+                GeneralAutoEncoderDetector = _GAE  # type: ignore
+            except Exception:
+                return None
+        gae = GeneralAutoEncoderDetector()
+        gae.load_model(candidate)
+        return gae
+    except Exception:
+        return None
+
+# Utility: attempt to guarantee GeneralAutoEncoderDetector is imported, return bool success
+def ensure_general_ae_class() -> bool:
+    """Attempt to import GeneralAutoEncoderDetector with rich diagnostics.
+
+    Stores error message and traceback in session_state keys:
+        gae_import_error, gae_import_error_trace, gae_import_sys_path, gae_import_candidates
+    """
+    import importlib, traceback, inspect, sys, pkgutil
+    global GeneralAutoEncoderDetector
+    if GeneralAutoEncoderDetector is not None:
+        # Record resolved file path for transparency
+        try:
+            import telecom_ai_platform.models.enhanced_autoencoder as _mod
+            st.session_state['gae_resolved_file'] = getattr(_mod, '__file__', 'unknown')
+        except Exception:
+            pass
+        return True
+    try:
+        # Enumerate candidate modules BEFORE import for debugging
+        candidates = [m.module_finder.path for m in pkgutil.iter_importers() if hasattr(m, 'path')]  # type: ignore
+        st.session_state['gae_import_candidates'] = candidates
+    except Exception:
+        st.session_state['gae_import_candidates'] = []
+    try:
+        import importlib.util, os
+        importlib.invalidate_caches()
+        spec = importlib.util.find_spec('telecom_ai_platform.models.enhanced_autoencoder')
+        if spec and spec.origin:
+            st.session_state['gae_candidate_path'] = spec.origin
+            try:
+                with open(spec.origin, 'rb') as f:
+                    raw = f.read()
+                st.session_state['gae_file_size'] = len(raw)
+                # Null byte scan
+                st.session_state['gae_null_bytes_found'] = b'\x00' in raw
+            except Exception:
+                pass
+        mod = importlib.import_module('telecom_ai_platform.models.enhanced_autoencoder')
+        GeneralAutoEncoderDetector = getattr(mod, 'GeneralAutoEncoderDetector')  # type: ignore
+        st.session_state['gae_resolved_file'] = getattr(mod, '__file__', 'unknown')
+        return True
+    except Exception as e:
+        st.session_state['gae_import_error'] = str(e)
+        st.session_state['gae_import_error_trace'] = traceback.format_exc()
+        st.session_state['gae_import_sys_path'] = list(sys.path)
+        return False
+
+
 def create_kpi_visualization(
     data: pd.DataFrame,
     site_id: str,
@@ -164,7 +265,7 @@ def create_kpi_visualization(
             full_results = results or []
             # Convert anomalies to DataFrame
             if results:
-                anomalies_df = pd.DataFrame([{
+                anomalies_raw = pd.DataFrame([{
                     'Date': pd.to_datetime(r.timestamp) if 'Date' in filtered.columns else r.timestamp,
                     'Site_ID': r.site_id,
                     'Sector_ID': r.sector_id,
@@ -174,6 +275,22 @@ def create_kpi_visualization(
                     'Score': r.anomaly_score,
                     'Threshold': r.threshold,
                 } for r in results if r.is_anomaly])
+                # Apply optional direction filtering (stored in session_state)
+                direction = st.session_state.get('anomaly_direction_filter', 'both')
+                if direction != 'both' and not anomalies_raw.empty:
+                    # Use percentile-based directional thresholds if provided in session
+                    p_hi = float(st.session_state.get('dir_high_pct', 95))
+                    p_lo = float(st.session_state.get('dir_low_pct', 5))
+                    hi_thr = np.percentile(anomalies_raw['Value'], p_hi)
+                    lo_thr = np.percentile(anomalies_raw['Value'], p_lo)
+                    if direction == 'high':
+                        anomalies_df = anomalies_raw[anomalies_raw['Value'] >= hi_thr]
+                    elif direction == 'low':
+                        anomalies_df = anomalies_raw[anomalies_raw['Value'] <= lo_thr]
+                    else:
+                        anomalies_df = anomalies_raw.copy()
+                else:
+                    anomalies_df = anomalies_raw
         except Exception:
             anomalies_df = detect_anomalies(filtered, kpi, threshold=2.0)
             if not anomalies_df.empty:
@@ -186,13 +303,47 @@ def create_kpi_visualization(
             anomalies_df['KPI'] = kpi
 
     if not anomalies_df.empty:
-        # Main anomalies series (time plot)
-        fig.add_trace(
-            go.Scatter(x=anomalies_df['Date'], y=anomalies_df['Value'], mode='markers', name='Anomalies',
-                        marker=dict(color='red', size=10, symbol='x'),
-                        hovertemplate='<b>Anomaly</b><br><b>Date:</b> %{x}<br><b>Value:</b> %{y:.2f}<extra></extra>'),
-            row=1, col=1
-        )
+        # Optional jitter to avoid overplotting when multiple anomalies share the same timestamp/value
+        use_jitter = st.session_state.get('anomaly_jitter_enabled', True)
+        if use_jitter:
+            # Compute small jitter proportional to local index
+            jit_scale = (anomalies_df['Value'].std() or 1.0) * 0.01
+            anomalies_df = anomalies_df.reset_index(drop=True).assign(_jitter=lambda d: ((d.index % 5) - 2) * jit_scale)
+            plot_values = anomalies_df['Value'] + anomalies_df['_jitter']
+        else:
+            plot_values = anomalies_df['Value']
+        # Plot by severity (if available) so nearby points differ in color/symbol
+        if 'Severity' in anomalies_df.columns:
+            sev_palette = {
+                'high': dict(color='#d62728', symbol='x'),
+                'medium': dict(color='#ff7f0e', symbol='diamond-open'),
+                'low': dict(color='#bcbd22', symbol='circle-open'),
+                'normal': dict(color='#1f77b4', symbol='circle')
+            }
+            for sev, sub in anomalies_df.groupby('Severity'):
+                pal = sev_palette.get(sev, dict(color='red', symbol='x'))
+                idxs = sub.index
+                fig.add_trace(
+                    go.Scatter(
+                        x=sub['Date'],
+                        y=plot_values.loc[idxs],
+                        mode='markers',
+                        name=f'Anomaly {sev}',
+                        marker=dict(color=pal['color'], size=11, symbol=pal['symbol'], line=dict(width=1,color='#222')),
+                        hovertemplate='<b>Anomaly</b><br><b>Severity:</b> '+sev+'<br><b>Date:</b> %{x}<br><b>Value:</b> %{y:.2f}<extra></extra>'
+                    ),
+                    row=1, col=1
+                )
+        else:
+            fig.add_trace(
+                go.Scatter(x=anomalies_df['Date'], y=plot_values, mode='markers', name='Anomalies',
+                            marker=dict(color='red', size=10, symbol='x'),
+                            hovertemplate='<b>Anomaly</b><br><b>Date:</b> %{x}<br><b>Value:</b> %{y:.2f}<extra></extra>'),
+                row=1, col=1
+            )
+        # Annotate total anomaly count
+        fig.add_annotation(text=f"Anomalies: {len(anomalies_df)}", xref='paper', x=0.01, yref='paper', y=0.98,
+                           showarrow=False, font=dict(size=11, color='#444'))
 
     if not show_model_threshold:
         # Classic statistical bands
@@ -332,7 +483,7 @@ def _window_by_last_days(df: pd.DataFrame, days: int) -> pd.DataFrame:
 
 def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
     ql = query.lower()
-    # Parse last N days; default 7 if any time-window intent
+    # Parse explicit last N days (no implicit default: use full range unless user specifies)
     m_days = re.search(r"last\s+(\d+)\s*days?", ql)
     days = int(m_days.group(1)) if m_days else (7 if "last week" in ql or "last 7" in ql else None)
 
@@ -340,7 +491,7 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
     if "which site" in ql and "anomal" in ql and not any(k in ql for k in [
         "sinr", "rsrp", "throughput", "dl_throughput", "ul_throughput", "rtt", "packet", "cpu", "active_users", "handover", "call_drop"
     ]):
-        win = _window_by_last_days(data, days or 7)
+        win = _window_by_last_days(data, days) if days is not None else data
         if win.empty:
             return {"steps": ["No data in selected window"], "context": "", "answer": "No data available for the requested window."}
         # Prefer model-based detectors if available
@@ -359,12 +510,12 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                 by_site.sort(key=lambda x: x[1], reverse=True)
                 top_site, top_count = by_site[0]
                 steps = [
-                    f"Filtered dataset to last {days or 7} days (relative to dataset max date)",
+                    (f"Filtered dataset to last {days} days" if days is not None else "Used entire dataset"),
                     "Used KPI-specific trained detectors (IF/OCSVM/GMM/AE) across available KPIs",
                     f"Ranked sites by total model-detected anomalies; top is {top_site} with {top_count}",
                 ]
                 context = "Top 5 counts:\n" + "\n".join([f"{s}: {c}" for s, c in by_site[:5]])
-                ans = f"{top_site} has the highest anomalies in the last {days or 7} days (count={top_count})."
+                ans = f"{top_site} has the highest anomalies in {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'} (count={top_count})."
                 return {"steps": steps, "context": context, "answer": ans}
             else:
                 return {"steps": ["Model returned no results in window"], "context": "", "answer": "No anomalies found in the requested window."}
@@ -386,19 +537,19 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                 by_site.sort(key=lambda x: x[1], reverse=True)
                 top_site, top_count = by_site[0]
                 steps = [
-                    f"Filtered dataset to last {days or 7} days (relative to dataset max date)",
+                    (f"Filtered dataset to last {days} days" if days is not None else "Used entire dataset"),
                     f"Used z-score fallback across KPIs: {', '.join(kpis)}",
                     f"Ranked sites by total anomaly count; top is {top_site} with {top_count}",
                 ]
                 context = "Top 5 counts:\n" + "\n".join([f"{s}: {c}" for s, c in by_site[:5]])
-                ans = f"{top_site} has the highest anomalies in the last {days or 7} days (count={top_count})."
+                ans = f"{top_site} has the highest anomalies in {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'} (count={top_count})."
                 return {"steps": steps, "context": context, "answer": ans}
             else:
                 return {"steps": ["No KPIs available for anomaly computation"], "context": "", "answer": "No anomalies found in the requested window."}
 
     # Case 1: Which site has highest SINR anomalies ...
     if "which site" in ql and "sinr" in ql and "anomal" in ql:
-        win = _window_by_last_days(data, days or 7)
+        win = _window_by_last_days(data, days) if days is not None else data
         det = get_ui_detector()
         by_site = []
         if det is not None and getattr(det, 'is_fitted', False):
@@ -414,12 +565,12 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                 by_site.sort(key=lambda x: x[1], reverse=True)
                 top_site, top_count = by_site[0]
                 steps = [
-                    f"Filtered dataset to last {days or 7} days (relative to dataset max date)",
+                    (f"Filtered dataset to last {days} days" if days is not None else "Used entire dataset"),
                     "Used KPI-specific SINR detector to count anomalies per site",
                     f"Ranked sites by anomaly count; top is {top_site} with {top_count}",
                 ]
                 context = "Top 5 counts:\n" + "\n".join([f"{s}: {c}" for s, c in by_site[:5]])
-                ans = f"{top_site} has the highest SINR anomalies in the last {days or 7} days (count={top_count})."
+                ans = f"{top_site} has the highest SINR anomalies in {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'} (count={top_count})."
                 return {"steps": steps, "context": context, "answer": ans}
             else:
                 return {"steps": ["Model returned no SINR results in window"], "context": "", "answer": "No anomalies found in the requested window."}
@@ -436,12 +587,12 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                 by_site.sort(key=lambda x: x[1], reverse=True)
                 top_site, top_count = by_site[0]
                 steps = [
-                    f"Filtered dataset to last {days or 7} days (relative to dataset max date)",
+                    (f"Filtered dataset to last {days} days" if days is not None else "Used entire dataset"),
                     "Used z-score fallback for SINR per site",
                     f"Ranked sites by anomaly count; top is {top_site} with {top_count}",
                 ]
                 context = "Top 5 counts:\n" + "\n".join([f"{s}: {c}" for s, c in by_site[:5]])
-                ans = f"{top_site} has the highest SINR anomalies in the last {days or 7} days (count={top_count})."
+                ans = f"{top_site} has the highest SINR anomalies in {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'} (count={top_count})."
                 return {"steps": steps, "context": context, "answer": ans}
             else:
                 return {"steps": ["No SINR data found in the selected window"], "context": "", "answer": "No anomalies found in the requested window."}
@@ -458,7 +609,8 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
             df = df[df['Site_ID'] == site_id]
             if sector_id:
                 df = df[df['Sector_ID'] == sector_id]
-            df = _window_by_last_days(df, days or 7)
+            if days is not None:
+                df = _window_by_last_days(df, days)
             if 'SINR' in df.columns and not df.empty:
                 det = get_ui_detector()
                 if det is not None and getattr(det, 'is_fitted', False):
@@ -474,11 +626,11 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                         recent_lines.append(f"{r.timestamp}: {r.value:.2f} (score={r.anomaly_score:.2f}, sev={r.severity})")
                     steps = [
                         f"Selected {site_id}{' / ' + sector_id if sector_id else ''}",
-                        f"Applied last {days or 7} days window (relative to dataset max date)",
+                        (f"Applied last {days} days window" if days is not None else "Used entire dataset (no time window specified)"),
                         "Used KPI-specific SINR detector to identify anomalies",
                     ]
                     ctx = "" if not recent_lines else ("Recent anomalies:\n" + "\n".join(recent_lines))
-                    ans = f"Detected {cnt} SINR anomalies for {site_id}{' / ' + sector_id if sector_id else ''} in the last {days or 7} days."
+                    ans = f"Detected {cnt} SINR anomalies for {site_id}{' / ' + sector_id if sector_id else ''} over {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'}."
                     return {"steps": steps, "context": ctx, "answer": ans}
                 else:
                     # Fallback z-score
@@ -487,57 +639,66 @@ def fast_answer_if_applicable(query: str, data: pd.DataFrame) -> Optional[Dict]:
                     recent = an_df.sort_values('Date').tail(3) if cnt else pd.DataFrame()
                     steps = [
                         f"Selected {site_id}{' / ' + sector_id if sector_id else ''}",
-                        f"Applied last {days or 7} days window (relative to dataset max date)",
+                        (f"Applied last {days} days window" if days is not None else "Used entire dataset (no time window specified)"),
                         "Used z-score fallback on SINR",
                     ]
                     ctx = "" if recent.empty else ("Recent anomalies:\n" + "\n".join([f"{r['Date']}: {r['SINR']:.2f}" for _, r in recent.iterrows()]))
-                    ans = f"Detected {cnt} SINR anomalies for {site_id}{' / ' + sector_id if sector_id else ''} in the last {days or 7} days."
+                    ans = f"Detected {cnt} SINR anomalies for {site_id}{' / ' + sector_id if sector_id else ''} over {('the last ' + str(days) + ' days') if days is not None else 'the entire dataset period'}."
                     return {"steps": steps, "context": ctx, "answer": ans}
 
-    # Case 3: Analyze DL Throughput anomalies for Site X Sector Y
-    if ("throughput" in ql or "dl_throughput" in ql) and "anomal" in ql and "site" in ql:
+    # Case 3: Analyze DL or UL Throughput anomalies for Site X Sector Y
+    if ("throughput" in ql or "dl_throughput" in ql or "ul_throughput" in ql or "uplink" in ql) and "anomal" in ql and "site" in ql:
         site_m = re.search(r"site\s*[:#_-]?\s*([\w-]+)", ql)
         sec_m = re.search(r"sector\s*[:#_-]?\s*([a-zA-Z])", ql)
         site_id = canonicalize_site(site_m.group(1), data) if site_m else None
         sector_id = canonicalize_sector(site_id, sec_m.group(1), data) if (site_id and sec_m) else None
         if site_id:
+            is_ul = any(tok in ql for tok in ["ul_throughput", "ul throughput", "uplink"]) and not any(tok in ql for tok in ["dl_throughput", "downlink"])
+            kpi_name = 'UL_Throughput' if is_ul else 'DL_Throughput'
             df = data.copy()
             df = df[df['Site_ID'] == site_id]
             if sector_id:
                 df = df[df['Sector_ID'] == sector_id]
-            df = _window_by_last_days(df, days or 15)
-            if 'DL_Throughput' in df.columns and not df.empty:
+            applied_window = False
+            if days is not None:
+                df = _window_by_last_days(df, days)
+                applied_window = True
+            if kpi_name in df.columns and not df.empty:
                 det = get_ui_detector()
                 if det is not None and getattr(det, 'is_fitted', False):
                     try:
-                        results = det.detect_anomalies(df, kpi_name='DL_Throughput')
-                        anomalies = [r for r in results if r.kpi_name == 'DL_Throughput' and r.is_anomaly and (not sector_id or (r.sector_id == sector_id))]
+                        results = det.detect_anomalies(df, kpi_name=kpi_name)
+                        anomalies = [r for r in results if r.kpi_name == kpi_name and r.is_anomaly and (not sector_id or (r.sector_id == sector_id))]
                     except Exception:
                         anomalies = []
                     cnt = len(anomalies)
                     recent_lines = []
                     for r in sorted(anomalies, key=lambda x: str(x.timestamp))[-3:]:
                         recent_lines.append(f"{r.timestamp}: {r.value:.2f} (score={r.anomaly_score:.2f}, sev={r.severity})")
-                    steps = [
-                        f"Selected {site_id}{' / ' + sector_id if sector_id else ''}",
-                        f"Applied last {days or 15} days window (relative to dataset max date)",
-                        "Used KPI-specific DL_Throughput detector to identify anomalies",
-                    ]
+                    steps = [f"Selected {site_id}{' / ' + sector_id if sector_id else ''}"]
+                    if applied_window:
+                        steps.append(f"Applied last {days} days window (relative to dataset max date)")
+                    else:
+                        steps.append("Used entire dataset (no time window specified)")
+                    steps.append(f"Used KPI-specific {kpi_name} detector to identify anomalies")
                     ctx = "" if not recent_lines else ("Recent anomalies:\n" + "\n".join(recent_lines))
-                    ans = f"Detected {cnt} DL Throughput anomalies for {site_id}{' / ' + sector_id if sector_id else ''} in the last {days or 15} days."
+                    period_text = f"the last {days} days" if applied_window else "the entire dataset period"
+                    ans = f"Detected {cnt} {kpi_name.replace('_',' ')} anomalies for {site_id}{' / ' + sector_id if sector_id else ''} over {period_text}."
                     return {"steps": steps, "context": ctx, "answer": ans}
                 else:
                     # Fallback z-score
-                    an_df = detect_anomalies(df, 'DL_Throughput', threshold=2.0)
+                    an_df = detect_anomalies(df, kpi_name, threshold=2.0)
                     cnt = len(an_df)
                     recent = an_df.sort_values('Date').tail(3) if cnt else pd.DataFrame()
-                    steps = [
-                        f"Selected {site_id}{' / ' + sector_id if sector_id else ''}",
-                        f"Applied last {days or 15} days window (relative to dataset max date)",
-                        "Used z-score fallback on DL_Throughput",
-                    ]
-                    ctx = "" if recent.empty else ("Recent anomalies:\n" + "\n".join([f"{r['Date']}: {r['DL_Throughput']:.2f}" for _, r in recent.iterrows()]))
-                    ans = f"Detected {cnt} DL Throughput anomalies for {site_id}{' / ' + sector_id if sector_id else ''} in the last {days or 15} days."
+                    steps = [f"Selected {site_id}{' / ' + sector_id if sector_id else ''}"]
+                    if applied_window:
+                        steps.append(f"Applied last {days} days window (relative to dataset max date)")
+                    else:
+                        steps.append("Used entire dataset (no time window specified)")
+                    steps.append(f"Used z-score fallback on {kpi_name}")
+                    ctx = "" if recent.empty else ("Recent anomalies:\n" + "\n".join([f"{r['Date']}: {r[kpi_name]:.2f}" for _, r in recent.iterrows()]))
+                    period_text = f"the last {days} days" if applied_window else "the entire dataset period"
+                    ans = f"Detected {cnt} {kpi_name.replace('_',' ')} anomalies for {site_id}{' / ' + sector_id if sector_id else ''} over {period_text}."
                     return {"steps": steps, "context": ctx, "answer": ans}
     return None
 
@@ -909,6 +1070,16 @@ def render_sidebar(data: pd.DataFrame):
     kpi = st.selectbox("KPI", sorted(kpis) if kpis else [], key="sidebar_kpi")
     multi_kpi = st.multiselect("Compare Multiple KPIs (optional)", sorted(kpis) if kpis else [], default=[], key="sidebar_multi_kpi")
 
+    # Anomaly direction filter (high vs low vs both) with domain default
+    default_dir = KPI_DEFAULT_DIRECTION.get(kpi, 'both') if kpi else 'both'
+    direction = st.radio("Anomaly Direction", ['both','high','low'], index=['both','high','low'].index(default_dir), key='anomaly_direction_filter', help="Filter displayed anomalies: high spikes, low dips, or both.")
+    if direction != 'both':
+        cdir1, cdir2 = st.columns(2)
+        with cdir1:
+            st.number_input("High %ile", 50.0, 100.0, value=float(st.session_state.get('dir_high_pct', 95.0)), step=0.5, key='dir_high_pct', help="Percentile threshold for high anomalies (values >= this).")
+        with cdir2:
+            st.number_input("Low %ile", 0.0, 50.0, value=float(st.session_state.get('dir_low_pct', 5.0)), step=0.5, key='dir_low_pct', help="Percentile threshold for low anomalies (values <= this).")
+
     # Time window for charts/anomalies
     st.markdown("---")
     st.subheader("Time Window")
@@ -1008,6 +1179,43 @@ def render_sidebar(data: pd.DataFrame):
         st.subheader("Model Catalog")
         st.dataframe(pd.DataFrame(get_model_catalog()), use_container_width=True)
 
+    # --- Per-KPI model parameters viewer (if detectors loaded) ---
+    ui_det = get_ui_detector()
+    if ui_det and getattr(ui_det, 'is_fitted', False):
+        with st.expander("KPI Model Parameters", expanded=False):
+            try:
+                kpi_list = sorted(list(ui_det.detectors.keys()))
+                sel_param_kpi = st.selectbox("Select KPI", kpi_list, key='sidebar_param_kpi') if kpi_list else None
+                if sel_param_kpi:
+                    det = ui_det.detectors.get(sel_param_kpi)
+                    if det and getattr(det, 'is_fitted', False):
+                        if hasattr(det, 'get_full_params'):
+                            st.json(det.get_full_params())
+                        else:
+                            st.json({
+                                'kpi_name': det.kpi_name,
+                                'algorithm': det.algorithm,
+                                'threshold': float(det.threshold) if det.threshold is not None else None,
+                                'params': getattr(det, 'params', {}),
+                                'feature_names': getattr(det, 'feature_names', []),
+                            })
+                    else:
+                        st.caption("Detector not fitted yet.")
+                if st.button("Export All KPI Params", key='export_all_kpi_params_sidebar'):
+                    try:
+                        all_params = ui_det.get_all_parameters() if hasattr(ui_det, 'get_all_parameters') else {}
+                        cfg_tmp = _Cfg()
+                        out_path = os.path.join(cfg_tmp.models_dir, 'kpi_models_parameters.json')
+                        with open(out_path, 'w') as f:
+                            json.dump(all_params, f, indent=2)
+                        st.success(f"Saved to {out_path}")
+                    except Exception as _exp_err:
+                        st.warning(f"Export failed: {_exp_err}")
+            except Exception as _param_err:
+                st.warning(f"Param viewer error: {_param_err}")
+    else:
+        st.caption("(KPI models not loaded – place .pkl files in models dir or train in Fine Tuning tab.)")
+
     # Chat behavior (outside sidebar)
     st.markdown("---")
     st.subheader("Chat Settings")
@@ -1073,19 +1281,20 @@ def main():
                         st.session_state['ui_detector'] = None
 
                 show_model_thr = st.toggle("Show model threshold & score distribution (instead of ±2σ)", value=False, help="Switches second panel to anomaly score distribution and overlays model-derived threshold.")
-                fig, anomalies_df = create_kpi_visualization(
-                    data,
-                    site,
-                    sector,
-                    kpi,
+                # Build KPI-specific figure first
+                kpi_fig, anomalies_df = create_kpi_visualization(
+                    data, site, sector, kpi,
                     detector=ui_detector,
                     last_days=st.session_state.get('last_days', 7),
                     show_model_threshold=show_model_thr,
                 )
-                if fig is not None:
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning("No data available for selection")
+                # Container with two columns: left KPI plot, right General AE plot
+                col_kpi_plot, col_gen_plot = st.columns(2)
+                with col_kpi_plot:
+                    if kpi_fig is not None:
+                        st.plotly_chart(kpi_fig, use_container_width=True)
+                    else:
+                        st.warning("No data available for selection")
                 # Anomaly table
                 filtered = data[(data['Site_ID'] == site) & (data['Sector_ID'] == sector)]
                 st.subheader("Anomaly Details")
@@ -1110,6 +1319,386 @@ def main():
                         st.dataframe(disp.sort_values('Date', ascending=False), use_container_width=True)
                     else:
                         st.info("No anomalies detected in the selected window.")
+
+                # --- NEW: General AutoEncoder overlay plot for this KPI (quick view) ---
+                try:
+                    gae_quick = load_general_autoencoder()
+                    if gae_quick is not None:
+                        st.markdown("#### General AutoEncoder Perspective (Quick Overlay)")
+                        # Align features to model expectations
+                        expected_feats = list(getattr(gae_quick, 'feature_names', []))
+                        base_cols = [c for c in expected_feats if c in filtered.columns]
+                        if not base_cols:
+                            base_cols = [c for c in filtered.columns if c not in ['Date','Site_ID','Sector_ID']]
+                        feat_block = filtered[base_cols].fillna(0.0)
+                        # Dimension adaptation
+                        if expected_feats and len(base_cols) != len(expected_feats):
+                            arr_tmp = feat_block.values
+                            cur_dim = arr_tmp.shape[1]; exp_dim = len(expected_feats)
+                            if cur_dim == 1 and exp_dim > 1:
+                                arr_tmp = np.repeat(arr_tmp, exp_dim, axis=1)
+                            elif cur_dim > exp_dim:
+                                arr_tmp = arr_tmp[:, :exp_dim]
+                            elif cur_dim < exp_dim:
+                                arr_tmp = np.hstack([arr_tmp, np.zeros((arr_tmp.shape[0], exp_dim - cur_dim))])
+                            feat_block = pd.DataFrame(arr_tmp, columns=expected_feats[:arr_tmp.shape[1]])
+                        arr_full = feat_block.values
+                        gae_out = gae_quick.detect_anomalies(arr_full)
+                        rec_err = gae_out['errors']
+                        rec_anom = gae_out['is_anomaly']
+                        import plotly.graph_objects as go
+                        from plotly.subplots import make_subplots
+                        fig_gae_overlay = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, subplot_titles=(f"{kpi} Value", "General AE Reconstruction Error"))
+                        # Row 1: KPI series + anomaly markers (where GAEs says anomaly)
+                        if kpi in filtered.columns:
+                            fig_gae_overlay.add_trace(go.Scatter(x=filtered['Date'], y=filtered[kpi], mode='lines', name=kpi), row=1, col=1)
+                            if rec_anom.any():
+                                fig_gae_overlay.add_trace(go.Scatter(x=filtered['Date'][rec_anom], y=filtered[kpi][rec_anom], mode='markers', name='GAE Anomaly', marker=dict(color='red', size=7, symbol='x')), row=1, col=1)
+                        # Row 2: Reconstruction error + threshold
+                        fig_gae_overlay.add_trace(go.Scatter(x=filtered['Date'], y=rec_err, mode='lines', name='Reconstruction Error'), row=2, col=1)
+                        if gae_quick.threshold is not None:
+                            fig_gae_overlay.add_hline(y=gae_quick.threshold, line_color='red', line_dash='dash', annotation=dict(text='Threshold'), row=2, col=1)
+                        fig_gae_overlay.update_layout(height=500, margin=dict(l=10,r=10,t=60,b=10))
+                        st.plotly_chart(fig_gae_overlay, use_container_width=True)
+                    else:
+                        st.caption("(General AE model not yet trained for overlay plot.)")
+                except Exception as gae_ov_err:
+                    st.warning(f"General AE overlay failed: {gae_ov_err}")
+
+                # General AutoEncoder side-by-side visualization
+                st.markdown("---")
+                st.subheader("General AutoEncoder (Cross-KPI) Reconstruction")
+                all_numeric_kpis = [c for c in data.columns if c not in ['Date','Site_ID','Sector_ID'] and pd.api.types.is_numeric_dtype(data[c])]
+                default_kpis = st.session_state.get('gae_selected_kpis') or all_numeric_kpis
+                with st.expander("General AE Configuration & Training", expanded=False):
+                    # --- Load existing model once for defaults / display ---
+                    existing_model = load_general_autoencoder()
+                    # Initialize session defaults from loaded model (only first time)
+                    if existing_model is not None and 'gae_param_defaults_loaded' not in st.session_state:
+                        # Threshold percentile
+                        if getattr(existing_model, 'threshold_percentile', None) is not None:
+                            st.session_state.setdefault('gae_thresh', int(existing_model.threshold_percentile))
+                        # Epochs default to 100 (notebook) if no history
+                        hist = getattr(existing_model, 'training_history', []) or []
+                        if hist:
+                            last_ep = hist[-1].get('epoch') or len(hist)
+                            st.session_state.setdefault('gae_epochs', int(min(500, max(20, last_ep))))
+                        else:
+                            st.session_state.setdefault('gae_epochs', 100)
+                        # Selected KPIs -> adopt feature_names intersection with available columns
+                        feat_names = getattr(existing_model, 'feature_names', []) or []
+                        if feat_names:
+                            st.session_state.setdefault('gae_selected_kpis', [f for f in feat_names if f in all_numeric_kpis][:50])
+                        # Advanced config prefill from last_training_config / attributes
+                        conf = getattr(existing_model, 'last_training_config', {}) or {}
+                        st.session_state.setdefault('gae_hidden_dims', ','.join(map(str, conf.get('hidden_dims', getattr(existing_model,'hidden_dims',[64,32,16])))))
+                        st.session_state.setdefault('gae_dropout', float(conf.get('dropout_rate', getattr(existing_model,'dropout_rate',0.2))))
+                        st.session_state.setdefault('gae_batch', int(conf.get('batch_size', getattr(existing_model,'batch_size',128))))
+                        st.session_state.setdefault('gae_lr', float(conf.get('learning_rate', getattr(existing_model,'learning_rate',1e-3))))
+                        st.session_state.setdefault('gae_pat', int(conf.get('early_stopping_patience', getattr(existing_model,'early_stopping_patience',30))))
+                        st.session_state.setdefault('gae_test_split', float(conf.get('test_split', getattr(existing_model,'test_split',0.0))))
+                        st.session_state.setdefault('gae_thr_mode', conf.get('threshold_mode', getattr(existing_model,'threshold_mode','percentile')))
+                        st.session_state.setdefault('gae_sigma_mult', float(conf.get('sigma_multiplier', getattr(existing_model,'sigma_multiplier',3.0))))
+                        st.session_state.setdefault('gae_target_frac', float(conf.get('target_anomaly_fraction', getattr(existing_model,'target_anomaly_fraction',0.05))))
+                        st.session_state.setdefault('gae_prob_cutoff', 0.05)
+                        st.session_state.setdefault('gae_z_cutoff', 3.0)
+                        st.session_state['gae_param_defaults_loaded'] = True
+                    # --- Show current model parameters if available ---
+                    if existing_model is not None:
+                        try:
+                            model_params = {
+                                'hidden_dims': getattr(existing_model, 'hidden_dims', None),
+                                'dropout_rate': getattr(existing_model, 'dropout_rate', None),
+                                'learning_rate': getattr(existing_model, 'learning_rate', None),
+                                'batch_size': getattr(existing_model, 'batch_size', None),
+                                'threshold_mode': getattr(existing_model, 'threshold_mode', None),
+                                'threshold_percentile': getattr(existing_model, 'threshold_percentile', None),
+                                'threshold': getattr(existing_model, 'threshold', None),
+                                'n_trained_epochs': (existing_model.training_history[-1]['epoch'] if getattr(existing_model, 'training_history', None) and existing_model.training_history[-1].get('epoch') else len(getattr(existing_model, 'training_history', []))),
+                                'feature_count': len(getattr(existing_model, 'feature_names', []) or []),
+                                'test_split': getattr(existing_model, 'test_split', None),
+                            }
+                            st.markdown("**Current Trained Model Parameters**")
+                            st.json(model_params)
+                        except Exception as _mp_err:
+                            st.caption(f"Model parameter display failed: {_mp_err}")
+                    sel_kpis = st.multiselect("Select KPIs to include in general model (features)", all_numeric_kpis, default=default_kpis)
+                    st.session_state['gae_selected_kpis'] = sel_kpis
+                    col_tr1, col_tr2, col_tr3 = st.columns([1,1,2])
+                    with col_tr1:
+                        # Use session default (possibly loaded from model)
+                        train_epochs_default = st.session_state.get('gae_epochs', 100)
+                        train_epochs = st.slider("Max Epochs", 20, 500, int(train_epochs_default), 10, key='gae_epochs')
+                    with col_tr2:
+                        thresh_pct_default = int(st.session_state.get('gae_thresh', 95))
+                        thresh_pct = st.slider("Threshold %", 80, 99, thresh_pct_default, 1, key='gae_thresh')
+                    with col_tr3:
+                        st.caption("Adjust reconstruction threshold percentile (higher -> fewer anomalies).")
+                    # Advanced settings
+                    adv_open = st.checkbox("Show Advanced Settings", value=False, key='gae_adv_toggle')
+                    if adv_open:
+                        c_adv1, c_adv2, c_adv3 = st.columns(3)
+                        with c_adv1:
+                            hidden_dims_input = st.text_input("Hidden Dims (comma)", value=st.session_state.get('gae_hidden_dims','128,64,32,16'), key='gae_hidden_dims')
+                            dropout_rate = st.number_input("Dropout", 0.0, 0.9, float(st.session_state.get('gae_dropout',0.25)), 0.05, key='gae_dropout')
+                            batch_size = st.number_input("Batch Size", 16, 1024, int(st.session_state.get('gae_batch',128)), 16, key='gae_batch')
+                        with c_adv2:
+                            learning_rate = st.number_input("Learning Rate", 1e-5, 1e-1, float(st.session_state.get('gae_lr',1e-3)), format='%e', key='gae_lr')
+                            early_stop_pat = st.number_input("EarlyStop Patience", 5, 100, int(st.session_state.get('gae_pat',30)), 1, key='gae_pat')
+                            test_split = st.number_input("Test Split", 0.0, 0.4, float(st.session_state.get('gae_test_split',0.0)), 0.05, key='gae_test_split')
+                        with c_adv3:
+                            threshold_mode = st.selectbox("Threshold Mode", ['percentile','val_sigma','target_anom_frac'], index=['percentile','val_sigma','target_anom_frac'].index(st.session_state.get('gae_thr_mode','percentile')), key='gae_thr_mode')
+                            sigma_mult = st.number_input("Sigma Multiplier", 1.0, 10.0, float(st.session_state.get('gae_sigma_mult',3.0)), 0.5, key='gae_sigma_mult')
+                            target_frac = st.number_input("Target Anom Fraction", 0.001, 0.5, float(st.session_state.get('gae_target_frac',0.05)), 0.005, key='gae_target_frac')
+                        c_adv4, c_adv5 = st.columns(2)
+                        with c_adv4:
+                            st.number_input("Prob Cutoff (tail)", 0.0001, 0.5, float(st.session_state.get('gae_prob_cutoff',0.05)), 0.005, key='gae_prob_cutoff')
+                        with c_adv5:
+                            st.number_input("Z-Score Cutoff", 0.5, 10.0, float(st.session_state.get('gae_z_cutoff',3.0)), 0.1, key='gae_z_cutoff')
+                    use_eng = st.checkbox("Use feature engineering (rolling / lags / ratios / temporal / site stats)", value=True, key='gae_use_eng')
+                    cols_train = st.columns([1,1,2])
+                    with cols_train[0]:
+                        start_train = st.button("Train / Retrain General AutoEncoder", key='gae_train_btn')
+                    with cols_train[1]:
+                        quick_apply = st.button("Apply & Retrain", key='gae_quick_apply', help="Retrain with current settings and immediately refresh plots")
+                    train_status_ph = st.empty()
+                    progress_bar = st.progress(0)
+                    loss_chart_ph = st.empty()
+                    feature_importance_ph = st.empty()
+                    # Training routine (site/sector agnostic: uses ALL rows for selected KPIs)
+                    if start_train or quick_apply:
+                        if not sel_kpis:
+                            st.warning("Select at least one KPI to train the general model.")
+                        else:
+                            try:
+                                if not ensure_general_ae_class():
+                                    err_msg = st.session_state.get('gae_import_error', 'Unknown import error')
+                                    st.error(f"General autoencoder class not available: {err_msg}")
+                                    # Inline debug (avoid nested expander)
+                                    st.markdown("**General AE Import Debug Details**")
+                                    st.write("Resolved File:", st.session_state.get('gae_resolved_file'))
+                                    st.write("Sys.path (first 10):", st.session_state.get('gae_import_sys_path', [])[:10])
+                                    st.write("Candidates:", st.session_state.get('gae_import_candidates'))
+                                    st.code(st.session_state.get('gae_import_error_trace', 'n/a'))
+                                    raise RuntimeError("GeneralAutoEncoderDetector class unavailable")
+                                # Parse advanced
+                                hidden_dims = [int(x.strip()) for x in st.session_state.get('gae_hidden_dims','64,32,16').split(',') if x.strip().isdigit()] if adv_open else [64,32,16]
+                                gae_local = GeneralAutoEncoderDetector(
+                                    hidden_dims=hidden_dims,
+                                    dropout_rate=st.session_state.get('gae_dropout',0.2) if adv_open else 0.2,
+                                    learning_rate=st.session_state.get('gae_lr',1e-3) if adv_open else 1e-3,
+                                    batch_size=st.session_state.get('gae_batch',128) if adv_open else 128,
+                                    max_epochs=train_epochs,
+                                    early_stopping_patience=st.session_state.get('gae_pat',30) if adv_open else 30,
+                                    validation_split=0.2,
+                                    test_split=st.session_state.get('gae_test_split',0.0) if adv_open else 0.0,
+                                    threshold_percentile=thresh_pct,
+                                    threshold_mode=st.session_state.get('gae_thr_mode','percentile') if adv_open else 'percentile',
+                                    sigma_multiplier=st.session_state.get('gae_sigma_mult',3.0) if adv_open else 3.0,
+                                    target_anomaly_fraction=st.session_state.get('gae_target_frac',0.05) if adv_open else 0.05,
+                                )  # type: ignore
+                                # Fit from dataframe using optional feature engineering
+                                from telecom_ai_platform.models.enhanced_autoencoder import engineer_features, build_feature_subset
+                                if use_eng:
+                                    eng_df = engineer_features(data, sel_kpis)
+                                    feat_df_full, feat_names = build_feature_subset(eng_df, sel_kpis)
+                                else:
+                                    feat_df_full = data[sel_kpis].fillna(0.0)
+                                    feat_names = sel_kpis
+                                total_epochs = train_epochs
+                                train_loss_hist: List[float] = []
+                                val_loss_hist: List[float] = []
+                                def _cb(ep, tot, tr, vl):
+                                    train_loss_hist.append(tr)
+                                    val_loss_hist.append(vl)
+                                    pct = int(ep / tot * 100)
+                                    progress_bar.progress(min(pct,100))
+                                    train_status_ph.info(f"Epoch {ep}/{tot} train_loss={tr:.5f} val_loss={vl:.5f}")
+                                    # Live loss curve (Plotly)
+                                    try:
+                                        import plotly.graph_objects as go
+                                        fig_loss = go.Figure()
+                                        fig_loss.add_trace(go.Scatter(y=train_loss_hist, x=list(range(1,len(train_loss_hist)+1)), mode='lines', name='Train Loss'))
+                                        fig_loss.add_trace(go.Scatter(y=val_loss_hist, x=list(range(1,len(val_loss_hist)+1)), mode='lines', name='Val Loss'))
+                                        fig_loss.update_layout(height=250, margin=dict(l=10,r=10,t=30,b=10), title='Training Progress (Loss)')
+                                        loss_chart_ph.plotly_chart(fig_loss, use_container_width=True)
+                                    except Exception:
+                                        pass
+                                st.session_state['gae_training_active'] = True
+                                fit_summary = gae_local.fit(feat_df_full.values, feature_names=feat_names, progress_callback=_cb)
+                                st.session_state['gae_training_active'] = False
+                                # Save model
+                                try:
+                                    cfg_tmp = _Cfg()
+                                    save_path = os.path.join(cfg_tmp.models_dir, 'general_autoencoder.pkl')
+                                    gae_local.save_model(save_path)
+                                    st.success("General autoencoder trained & saved." if start_train else "General autoencoder quick retrain complete.")
+                                    st.code(save_path)
+                                    st.json(fit_summary)
+                                    # Clear cached loader so new model loads
+                                    load_general_autoencoder.clear()
+                                    # Inline feature importance (top 15)
+                                    try:
+                                        import plotly.express as px
+                                        fi_df = gae_local.get_feature_importance(feat_df_full.values)
+                                        top_fi = fi_df.head(15)
+                                        fi_fig = px.bar(top_fi, x='importance', y='feature', orientation='h', title='Top 15 Feature Importance (Reconstruction Error)', height=450)
+                                        fi_fig.update_layout(margin=dict(l=10,r=10,t=40,b=10))
+                                        feature_importance_ph.plotly_chart(fi_fig, use_container_width=True)
+                                    except Exception as _fe:
+                                        st.warning(f"Feature importance unavailable: {_fe}")
+                                except Exception as se:
+                                    st.warning(f"Model trained but save failed: {se}")
+                            except Exception as te:
+                                st.error(f"Training failed: {te}")
+                gae = load_general_autoencoder()
+                if gae is None:
+                    st.caption("General autoencoder not available (train it above).")
+                else:
+                    try:
+                        # Build feature matrix for current site/sector over selected KPIs (or all available if mismatch)
+                        use_kpis = st.session_state.get('gae_selected_kpis') or [c for c in filtered.columns if c not in ['Date','Site_ID','Sector_ID']]
+                        use_kpis = [k for k in use_kpis if k in filtered.columns]
+                        # Attempt to reconstruct engineered feature set if model trained with engineering
+                        raw_feat_df = filtered[use_kpis].copy()
+                        feat_df = raw_feat_df.fillna(0.0)
+                        expected_features = list(getattr(gae, 'feature_names', []))
+                        used_engineering = False
+                        if expected_features and len(expected_features) > len(use_kpis):
+                            try:
+                                from telecom_ai_platform.models.enhanced_autoencoder import engineer_features, build_feature_subset
+                                eng_df = engineer_features(filtered, use_kpis)
+                                eng_feat_df, eng_names = build_feature_subset(eng_df, use_kpis)
+                                # Reorder to expected_features intersection
+                                cols = [c for c in expected_features if c in eng_feat_df.columns]
+                                if len(cols) >= 1:
+                                    feat_df = eng_feat_df[cols].fillna(0.0)
+                                    used_engineering = True
+                            except Exception as fe:
+                                st.warning(f"Feature engineering reconstruction failed, falling back to raw KPIs: {fe}")
+                        # Dimension adaptation fallback if still mismatched
+                        if expected_features:
+                            exp_dim = len(expected_features)
+                            cur_dim = feat_df.shape[1]
+                            if cur_dim != exp_dim:
+                                arr_tmp = feat_df.values
+                                if cur_dim == 1 and exp_dim > 1:
+                                    arr_tmp = np.repeat(arr_tmp, exp_dim, axis=1)
+                                elif cur_dim > exp_dim:
+                                    arr_tmp = arr_tmp[:, :exp_dim]
+                                else:  # pad zeros
+                                    pad = exp_dim - cur_dim
+                                    arr_tmp = np.hstack([arr_tmp, np.zeros((arr_tmp.shape[0], pad))])
+                                feat_df = pd.DataFrame(arr_tmp, columns=expected_features[:arr_tmp.shape[1]])
+                        if used_engineering:
+                            st.caption(f"Evaluation used engineered features ({feat_df.shape[1]} features)")
+                        else:
+                            if expected_features and feat_df.shape[1] == len(expected_features):
+                                st.caption("Evaluation using raw features matching trained set")
+                            elif expected_features:
+                                st.caption(f"Feature dimension adapted: model expects {len(expected_features)}, provided {feat_df.shape[1]}")
+                        if feat_df.empty:
+                            st.info("No KPI data available for reconstruction with selected features.")
+                        else:
+                            arr = feat_df.values
+                            out = gae.detect_anomalies(arr)
+                            errs = out['errors']; base_mask = out['is_anomaly']
+                            zscores = out.get('z_scores'); psi = out.get('psi'); probs = out.get('probabilities')
+                            # Anomaly mode selection
+                            anom_mode = st.selectbox("Anomaly Mode", ["reconstruction_error","probability","z_score"], key='gae_anom_mode')
+                            if anom_mode == 'probability' and probs is not None:
+                                prob_cut = st.session_state.get('gae_prob_cutoff',0.05)
+                                mask = probs < prob_cut
+                            elif anom_mode == 'z_score' and zscores is not None:
+                                z_cut = st.session_state.get('gae_z_cutoff',3.0)
+                                mask = zscores > z_cut
+                            else:
+                                mask = base_mask
+                            # Drift alert classification
+                            drift_msg = None; drift_level = None
+                            if psi == psi:  # not NaN
+                                if psi < 0.1:
+                                    drift_level = 'low'
+                                elif psi < 0.25:
+                                    drift_level = 'moderate'
+                                else:
+                                    drift_level = 'high'
+                                drift_msg = f"PSI={psi:.3f} ({drift_level})"
+                                # Maintain history
+                                hist_list = st.session_state.get('gae_psi_history', [])
+                                hist_list.append({'ts': pd.Timestamp.utcnow().isoformat(), 'psi': float(psi)})
+                                st.session_state['gae_psi_history'] = hist_list[-200:]
+                            cga, cgb, cgc, cgd, cge = st.columns(5)
+                            with cga: st.metric("Samples", len(errs))
+                            with cgb: st.metric("Mean Err", f"{errs.mean():.4f}")
+                            with cgc: st.metric("Anomalies", int(mask.sum()))
+                            with cgd: st.metric("Mode", anom_mode)
+                            with cge: st.metric("PSI", drift_msg or "N/A")
+                            if drift_level == 'moderate':
+                                st.warning("Moderate distribution shift detected vs training baseline.")
+                            elif drift_level == 'high':
+                                st.error("Significant drift detected – consider retraining.")
+                            # Drift history chart
+                            # Ensure plotly.graph_objects imported BEFORE first use (psi history uses go)
+                            import plotly.graph_objects as go  # moved up to avoid UnboundLocalError
+                            if st.session_state.get('gae_psi_history'):
+                                psi_df = pd.DataFrame(st.session_state['gae_psi_history'])
+                                psi_df['ts'] = pd.to_datetime(psi_df['ts'])
+                                psi_fig = go.Figure(); psi_fig.add_trace(go.Scatter(x=psi_df['ts'], y=psi_df['psi'], mode='lines+markers', name='PSI'))
+                                psi_fig.update_layout(height=160, margin=dict(l=10,r=10,t=30,b=10), title='PSI History')
+                                st.plotly_chart(psi_fig, use_container_width=True)
+                            rec_fig = go.Figure()
+                            rec_fig.add_trace(go.Scatter(x=filtered['Date'], y=errs, mode='lines', name='Reconstruction Error', hovertemplate='Date=%{x}<br>Error=%{y:.4f}<extra></extra>'))
+                            # Provide context: show selected KPI raw values scaled (optional) if available
+                            if kpi in filtered.columns:
+                                try:
+                                    vals = filtered[kpi].astype(float)
+                                    # Normalize KPI values to error scale for dual-display (min-max)
+                                    vmin, vmax = vals.min(), vals.max()
+                                    if vmax > vmin:
+                                        norm_vals = (vals - vmin) / (vmax - vmin)
+                                        # Scale to 90% of max error for visibility
+                                        scale = (np.max(errs) * 0.9) if len(errs) else 1.0
+                                        rec_fig.add_trace(go.Scatter(x=filtered['Date'], y=norm_vals * scale, mode='lines', name=f'{kpi} (normalized)', line=dict(dash='dot', width=1), opacity=0.6, hovertemplate='Date=%{x}<br>Norm {kpi}=%{y:.4f}<extra></extra>'))
+                                except Exception:
+                                    pass
+                            if gae.threshold is not None:
+                                rec_fig.add_hline(y=gae.threshold, line_color='red', line_dash='dash', annotation=dict(text='Threshold'))
+                            if mask.any():
+                                rec_fig.add_trace(go.Scatter(x=filtered['Date'][mask], y=errs[mask], mode='markers', name='Anomaly', marker=dict(color='red', size=8, symbol='x')))
+                            rec_fig.update_layout(height=300, margin=dict(l=10,r=10,t=40,b=10), title=f"General AE Reconstruction Error (Mode: {anom_mode})")
+                            st.plotly_chart(rec_fig, use_container_width=True)
+                            dist_fig = go.Figure()
+                            dist_fig.add_trace(go.Histogram(x=errs, nbinsx=40, name='Errors', marker_color='#88c'))
+                            if gae.threshold is not None:
+                                dist_fig.add_vline(x=gae.threshold, line_color='red', line_dash='dash')
+                            dist_fig.update_layout(height=250, margin=dict(l=10,r=10,t=40,b=10), title="Reconstruction Error Distribution")
+                            st.plotly_chart(dist_fig, use_container_width=True)
+                            with st.expander("Per-sample reconstruction (head)", expanded=False):
+                                head_n = min(100, len(errs))
+                                tbl = pd.DataFrame({
+                                    'Date': pd.to_datetime(filtered['Date']).dt.strftime('%Y-%m-%d %H:%M:%S'),
+                                    'Reconstruction_Error': errs,
+                                    'GenAE_Anomaly': mask
+                                }).head(head_n)
+                                st.dataframe(tbl, use_container_width=True)
+                            # Feature importance
+                            with st.expander("Feature Importance & Per-Feature Error", expanded=False):
+                                try:
+                                    imp_df = gae.get_feature_importance(arr)
+                                    import plotly.express as px
+                                    top_n = st.slider("Top N", 5, min(50, len(imp_df)), min(20, len(imp_df)), 1, key='gae_feat_topn') if len(imp_df) > 5 else len(imp_df)
+                                    show_df = imp_df.head(top_n)
+                                    bar_fig = px.bar(show_df[::-1], x='importance', y='feature', orientation='h')
+                                    bar_fig.update_layout(height=400, margin=dict(l=10,r=10,t=40,b=10))
+                                    st.plotly_chart(bar_fig, use_container_width=True)
+                                    std_imp = imp_df.copy()
+                                    std_imp['std_z'] = (std_imp['importance'] - std_imp['importance'].mean()) / (std_imp['importance'].std()+1e-12)
+                                    st.dataframe(show_df.merge(std_imp[['feature','std_z']], on='feature'), use_container_width=True)
+                                except Exception as fe:
+                                    st.warning(f"Feature importance failed: {fe}")
+                    except Exception as e:
+                        st.warning(f"General autoencoder evaluation failed: {e}")
             else:
                 st.info("Select Site, Sector, and KPI in the sidebar.")
 
@@ -1307,111 +1896,97 @@ def main():
                     params['n_components'] = st.slider("n_components", 1, 10, 2, 1)
                     params['random_state'] = 42
                 elif selected_algo == 'autoencoder':
-                    params['encoding_dim'] = st.slider("encoding_dim", 4, 128, 32, 4)
-                    params['epochs'] = st.slider("epochs", 10, 300, 50, 10)
-                    params['learning_rate'] = st.select_slider("learning_rate", options=[1e-4, 5e-4, 1e-3, 5e-3, 1e-2], value=1e-3)
-                    params['sequence_length'] = st.slider("sequence_length", 1, 30, 7, 1, help=">1 triggers LSTM AE for Throughput KPIs")
-                elif selected_algo == 'ensemble_if_gmm':
-                    params['contamination'] = st.slider("contamination (IF)", 0.01, 0.3, 0.05, 0.01)
-                    params['if_n_estimators'] = st.slider("IF n_estimators", 50, 400, 100, 10)
-                    params['weight_if'] = st.slider("Weight IF", 0.0, 1.0, 0.5, 0.05)
-                    params['weight_gmm'] = 1.0 - params['weight_if']
+                    params['encoding_dim'] = st.slider("encoding_dim", 4, 256, 32, 4)
+                    params['epochs'] = st.slider("epochs", 10, 500, 50, 10)
+                    params['learning_rate'] = st.number_input("learning_rate", min_value=1e-5, max_value=1e-1, value=1e-3, step=1e-4, format='%e')
+                    params['batch_size'] = st.slider("batch_size", 16, 512, 64, 16)
+                    params['sequence_length'] = st.slider("sequence_length (LSTM if >1 for Throughput KPIs)", 1, 30, 7, 1)
                 elif selected_algo == 'time_series_decomposition':
-                    params['use_prophet'] = st.checkbox("Use Prophet if available", value=True)
-                    params['season_period'] = st.slider("Seasonal period (days)", 3, 60, 7, 1)
+                    params['period'] = st.slider("Seasonal Period (days)", 3, 30, 7, 1)
+                    params['use_prophet'] = st.checkbox("Try Prophet residual enhancement", value=True)
                 elif selected_algo == 'seasonal_hybrid_esd':
-                    params['max_anoms_ratio'] = st.slider("Max anomalies ratio", 0.01, 0.3, 0.1, 0.01)
-                    params['alpha'] = st.slider("Alpha (significance)", 0.001, 0.2, 0.05, 0.001)
-                    params['period'] = st.slider("Seasonal period", 3, 60, 7, 1)
-
-                # Data slice
-                def _filter_for_window(df: pd.DataFrame, days: int) -> pd.DataFrame:
-                    if 'Date' not in df.columns:
-                        return df
-                    df = df.copy()
-                    end = pd.to_datetime(df['Date']).max()
-                    from datetime import timedelta
-                    start = end - timedelta(days=int(days))
-                    return df[pd.to_datetime(df['Date']) >= start]
-
+                    params['seasonal_window'] = st.slider("Seasonal Window (approx period)", 3, 30, 7, 1)
+                    params['zscore_sigma'] = st.slider("Z-score Sigma for candidate anomalies", 1.0, 6.0, 3.0, 0.5)
+                    params['max_anom_frac'] = st.slider("Max anomaly fraction", 0.01, 0.5, 0.1, 0.01)
+                # --- Prepare training slice ---
+                cfg = _Cfg()
                 train_df = data[(data['Site_ID'] == ft_site) & (data['Sector_ID'] == ft_sector)].copy()
-                train_df = _filter_for_window(train_df, ft_days)
+                if 'Date' in train_df.columns and len(train_df):
+                    try:
+                        train_df['Date'] = pd.to_datetime(train_df['Date'])
+                        cutoff = train_df['Date'].max() - pd.Timedelta(days=int(ft_days))
+                        train_df = train_df[train_df['Date'] >= cutoff]
+                    except Exception:
+                        pass
+                X = train_df[[ft_kpi]].fillna(0.0).values if ft_kpi in train_df.columns else np.empty((0,1))
 
-                # Debounce: explicit Train button; also track hash of (algo, params, site, sector, days)
-                current_signature = (selected_algo, tuple(sorted(params.items())), ft_site, ft_sector, int(ft_days))
-                last_sig_key = f"last_sig__{ft_kpi}"
-                train_clicked = st.button("Train / Preview Model", key="tune_train")
-                tuned_key = f"tuned__{ft_kpi}"
+                tuned_key = f"tuned_model__{ft_kpi}"
+                last_sig_key = f"tuned_signature__{ft_kpi}"
+                current_signature = f"{ft_site}|{ft_sector}|{ft_kpi}|{ft_days}|{selected_algo}|{params}"
+                train_clicked = st.button("Train / Preview Model", key="train_preview_btn")
 
                 def _train():
-                    cfg = _Cfg()
-                    # Apply sequence_length if relevant
-                    if selected_algo == 'autoencoder':
-                        cfg.model.autoencoder_params['encoding_dim'] = int(params.get('encoding_dim', 32))
-                        cfg.model.autoencoder_params['epochs'] = int(params.get('epochs', 50))
-                        cfg.model.autoencoder_params['learning_rate'] = float(params.get('learning_rate', 1e-3))
-                        cfg.model.sequence_length = int(params.get('sequence_length', 7))
-                    if selected_algo == 'isolation_forest':
-                        cfg.model.isolation_forest_params['contamination'] = float(params['contamination'])
-                        cfg.model.isolation_forest_params['n_estimators'] = int(params['n_estimators'])
-                    det = KPISpecificDetector(ft_kpi, cfg)
-                    det.algorithm = selected_algo  # override mapping for tuning
-                    X = train_df[[ft_kpi]].dropna().values
-                    if X.shape[0] < 10:
-                        st.warning("Not enough samples in window.")
+                    if X.shape[0] == 0:
+                        st.warning("No data available for selected filters.")
                         return None
-                    # Custom training paths
+                    det = KPISpecificDetector(ft_kpi, cfg)
+                    det.algorithm = selected_algo
+                    det.params = params.copy()
+                    # Fit according to algorithm
                     if selected_algo == 'isolation_forest':
                         from sklearn.ensemble import IsolationForest
-                        det.model = IsolationForest(**cfg.model.isolation_forest_params)
                         Xs = det.scaler.fit_transform(X)
-                        det.model.fit(Xs)
+                        det.model = IsolationForest(contamination=float(params['contamination']), n_estimators=int(params['n_estimators']), random_state=42).fit(Xs)
                         det.is_fitted = True
                         det._calculate_threshold(Xs)
                     elif selected_algo == 'local_outlier_factor':
                         from sklearn.neighbors import LocalOutlierFactor
-                        # Use novelty=True so we can score new samples consistently outside training window
-                        det.model = LocalOutlierFactor(n_neighbors=int(params['n_neighbors']), contamination=float(params['contamination']), novelty=True)
                         Xs = det.scaler.fit_transform(X)
-                        det.model.fit(Xs)
+                        det.model = LocalOutlierFactor(n_neighbors=int(params['n_neighbors']), contamination=float(params['contamination']), novelty=True).fit(Xs)
                         det.is_fitted = True
                         det._calculate_threshold(Xs)
                     elif selected_algo == 'one_class_svm':
                         from sklearn.svm import OneClassSVM
-                        det.model = OneClassSVM(nu=float(params['nu']), kernel=params['kernel'], gamma=params['gamma'])
                         Xs = det.scaler.fit_transform(X)
-                        det.model.fit(Xs)
+                        det.model = OneClassSVM(nu=float(params['nu']), kernel=params['kernel'], gamma=params['gamma']).fit(Xs)
                         det.is_fitted = True
                         det._calculate_threshold(Xs)
                     elif selected_algo == 'gaussian_mixture':
                         from sklearn.mixture import GaussianMixture
-                        det.model = GaussianMixture(n_components=int(params['n_components']), random_state=42)
                         Xs = det.scaler.fit_transform(X)
-                        det.model.fit(Xs)
+                        det.model = GaussianMixture(n_components=int(params['n_components']), random_state=42).fit(Xs)
                         det.is_fitted = True
                         det._calculate_threshold(Xs)
                     elif selected_algo == 'autoencoder':
-                        det.fit(X)  # uses AE/LSTM internally based on sequence_length
+                        # Inject chosen hyperparameters into config before fit
+                        try:
+                            det.config.model.autoencoder_params['encoding_dim'] = int(params['encoding_dim'])
+                            det.config.model.autoencoder_params['epochs'] = int(params['epochs'])
+                            det.config.model.autoencoder_params['learning_rate'] = float(params['learning_rate'])
+                            det.config.model.autoencoder_params['batch_size'] = int(params['batch_size'])
+                            det.config.model.sequence_length = int(params['sequence_length'])
+                        except Exception:
+                            pass
+                        det.fit(X)
                     elif selected_algo == 'ensemble_if_gmm':
                         from sklearn.ensemble import IsolationForest
                         from sklearn.mixture import GaussianMixture
                         Xs = det.scaler.fit_transform(X)
                         det.model = {
-                            'if': IsolationForest(contamination=float(params['contamination']), n_estimators=int(params['if_n_estimators']), random_state=42).fit(Xs),
+                            'if': IsolationForest(contamination=float(params.get('contamination', 0.05)), n_estimators=int(params.get('if_n_estimators', 100)), random_state=42).fit(Xs),
                             'gmm': GaussianMixture(n_components=2, random_state=42).fit(Xs),
-                            'weights': (float(params['weight_if']), float(params['weight_gmm']))
+                            'weights': (float(params.get('weight_if', 0.5)), float(params.get('weight_gmm', 0.5)))
                         }
                         det.is_fitted = True
                         scores = det._get_anomaly_scores(Xs)
                         det.threshold = np.percentile(scores, (1 - cfg.model.contamination_rate) * 100)
                     elif selected_algo == 'time_series_decomposition':
-                        det.fit(X)  # internal handles decomposition
+                        det.fit(X)
                     elif selected_algo == 'seasonal_hybrid_esd':
                         det.fit(X)
                     else:
-                        st.error("Unsupported algorithm.")
+                        st.error('Unsupported algorithm.')
                         return None
-                    det.params = params
                     return det
 
                 if train_clicked or (st.session_state.get(tuned_key) is not None and st.session_state.get(last_sig_key) != current_signature):
@@ -1420,6 +1995,13 @@ def main():
                         tuned = _train()
                         st.session_state[tuned_key] = tuned
                         st.session_state[last_sig_key] = current_signature
+                        # Persist last-used params per KPI (sidecar JSON)
+                        try:
+                            cfgp = _Cfg(); sidecar = os.path.join(cfgp.models_dir, f"{ft_kpi}_last_params.json")
+                            with open(sidecar, 'w') as f:
+                                json.dump({'kpi': ft_kpi, 'algorithm': selected_algo, 'params': params}, f, indent=2)
+                        except Exception:
+                            pass
                 tuned = st.session_state.get(tuned_key)
                 if tuned is not None:
                     # Preview anomalies on training slice

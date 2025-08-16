@@ -29,6 +29,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import OneClassSVM
+from sklearn.cluster import DBSCAN
 
 # Optional libs
 try:  # STL
@@ -138,6 +139,9 @@ class KPISpecificDetector(LoggerMixin):
         "Packet_Loss": "one_class_svm",
         "Handover_Success_Rate": "gaussian_mixture",
         "Handover_Success": "gaussian_mixture",
+    # Additional optional algorithms selectable via UI
+    "_DBSCAN": "dbscan",
+    "_CONTROL": "control_chart",
     }
 
     def __init__(self, kpi_name: str, config: TelecomConfig):
@@ -155,14 +159,27 @@ class KPISpecificDetector(LoggerMixin):
 
     def _create_model(self):
         if self.algorithm == "isolation_forest":
+            self.params = dict(self.config.model.isolation_forest_params)
             return IsolationForest(**self.config.model.isolation_forest_params)
         if self.algorithm == "one_class_svm":
+            self.params = dict(self.config.model.one_class_svm_params)
             return OneClassSVM(**self.config.model.one_class_svm_params)
         if self.algorithm == "gaussian_mixture":
+            self.params = {"n_components": 2, "random_state": 42}
             return GaussianMixture(n_components=2, random_state=42)
         if self.algorithm == "local_outlier_factor":
             # Use novelty=True so we can score new (unseen) samples consistently in main view
+            self.params = {"contamination": self.config.model.contamination_rate, "novelty": True}
             return LocalOutlierFactor(contamination=self.config.model.contamination_rate, novelty=True)
+        if self.algorithm == "dbscan":
+            # Params should have been set externally; provide defaults
+            eps = float(self.params.get("eps", 0.5))
+            ms = int(self.params.get("min_samples", 5))
+            self.params.update({"eps": eps, "min_samples": ms})
+            return DBSCAN(eps=eps, min_samples=ms)
+        if self.algorithm == "control_chart":
+            # No sklearn model; handled manually
+            return None
         if self.algorithm == "autoencoder":
             return None
         if self.algorithm in ["ensemble_if_gmm", "time_series_decomposition", "seasonal_hybrid_esd"]:
@@ -184,8 +201,20 @@ class KPISpecificDetector(LoggerMixin):
             seq_len = int(getattr(self.config.model, "sequence_length", 7) or 7)
             if self.kpi_name in ["DL_Throughput", "UL_Throughput"] and seq_len > 1:
                 self._fit_lstm_autoencoder(X_proc, seq_len)
+                self.params = {
+                    "model_type": "lstm_autoencoder",
+                    "sequence_length": seq_len,
+                    "epochs": self.config.model.autoencoder_params["epochs"],
+                    "learning_rate": self.config.model.autoencoder_params["learning_rate"],
+                }
             else:
                 self._fit_autoencoder(X_proc)
+                self.params = {
+                    "model_type": "feedforward_autoencoder",
+                    "encoding_dim": self.config.model.autoencoder_params["encoding_dim"],
+                    "epochs": self.config.model.autoencoder_params["epochs"],
+                    "learning_rate": self.config.model.autoencoder_params["learning_rate"],
+                }
             self._calculate_threshold(X_proc)
         elif self.algorithm == "ensemble_if_gmm":
             if_model = IsolationForest(**self.config.model.isolation_forest_params).fit(X_proc)
@@ -194,6 +223,11 @@ class KPISpecificDetector(LoggerMixin):
             self.is_fitted = True
             scores = self._get_anomaly_scores(X_proc)
             self.threshold = float(np.percentile(scores, (1 - self.config.model.contamination_rate) * 100))
+            self.params = {
+                "if_params": dict(self.config.model.isolation_forest_params),
+                "gmm_params": {"n_components": 2, "random_state": 42},
+                "weights": (0.5, 0.5),
+            }
         elif self.algorithm == "time_series_decomposition":
             series = X_proc[:, 0]
             stl_res = None
@@ -231,6 +265,7 @@ class KPISpecificDetector(LoggerMixin):
             self.model = model_dict
             self.threshold = 3.0
             self.is_fitted = True
+            self.params = {k: v for k, v in model_dict.items() if k in ["use_stl", "prophet_used", "res_std", "res_mean"] or k.endswith("_used")}
         elif self.algorithm == "seasonal_hybrid_esd":
             series = X_proc[:, 0]
             period = max(3, min(7, len(series)//12 or 7))
@@ -252,6 +287,34 @@ class KPISpecificDetector(LoggerMixin):
             except Exception:
                 self.threshold = 3.0
             self.is_fitted = True
+            self.params = {"period": period, "res_mean": res_mean, "res_std": res_std}
+        elif self.algorithm == "dbscan":
+            # Fit DBSCAN directly; treat noise points label=-1 as anomalies.
+            eps = float(self.params.get("eps", 0.5))
+            ms = int(self.params.get("min_samples", 5))
+            self.model = DBSCAN(eps=eps, min_samples=ms).fit(X_proc)
+            self.is_fitted = True
+            labels = getattr(self.model, 'labels_', np.array([]))
+            noise_frac = float(np.mean(labels == -1)) if len(labels) else 0.0
+            # Set threshold for score (binary) classification
+            self.threshold = 0.5
+            self.params.update({"eps": eps, "min_samples": ms, "noise_fraction": noise_frac})
+        elif self.algorithm == "control_chart":
+            # Simple rolling mean/std control limits
+            series = X_proc[:, 0]
+            window = int(self.params.get("window", 7))
+            sigma_limit = float(self.params.get("sigma_limit", 3.0))
+            roll_mean = pd.Series(series).rolling(window=window, min_periods=1).mean().to_numpy()
+            roll_std = pd.Series(series).rolling(window=window, min_periods=1).std().fillna(0).to_numpy()
+            self.model = {
+                "window": window,
+                "sigma_limit": sigma_limit,
+                "roll_mean_tail": roll_mean[-5000:],
+                "roll_std_tail": roll_std[-5000:],
+            }
+            self.threshold = sigma_limit  # applied to z-score magnitude
+            self.is_fitted = True
+            self.params.update({"window": window, "sigma_limit": sigma_limit})
         else:  # standard model
             self.model = self._create_model()
             if self.model is not None:
@@ -390,6 +453,23 @@ class KPISpecificDetector(LoggerMixin):
             if hasattr(self.model, "score_samples"):
                 return -self.model.score_samples(X)
             return -getattr(self.model, "negative_outlier_factor_", np.zeros(len(X)))
+        if self.algorithm == "dbscan":
+            # Refit on provided X to get labels (DBSCAN has no partial_predict)
+            eps = float(self.params.get("eps", 0.5))
+            ms = int(self.params.get("min_samples", 5))
+            model = DBSCAN(eps=eps, min_samples=ms).fit(X)
+            labels = getattr(model, 'labels_', np.zeros(len(X)))
+            # Score = 1 for noise (-1), 0 otherwise
+            return (labels == -1).astype(float)
+        if self.algorithm == "control_chart":
+            # Compute rolling z-score
+            window = int(self.params.get("window", 7))
+            sigma_limit = float(self.params.get("sigma_limit", 3.0))
+            series = X[:, 0]
+            roll_mean = pd.Series(series).rolling(window=window, min_periods=1).mean().to_numpy()
+            roll_std = pd.Series(series).rolling(window=window, min_periods=1).std().fillna(1e-8).to_numpy()
+            z = np.abs(series - roll_mean) / (roll_std + 1e-8)
+            return z
         if self.algorithm == "ensemble_if_gmm":
             if_scores = -self.model["if"].score_samples(X)
             gmm_scores = -self.model["gmm"].score_samples(X)
@@ -535,6 +615,13 @@ class KPISpecificDetector(LoggerMixin):
                 model.to(self.device)
                 model.eval()
                 self.model = model
+                # Populate params if missing
+                if not self.params:
+                    self.params = {
+                        "model_type": "lstm_autoencoder",
+                        "sequence_length": seq_len,
+                        "latent_dim": latent_dim,
+                    }
             else:
                 try:
                     enc0_w = state["encoder.0.weight"]
@@ -549,10 +636,26 @@ class KPISpecificDetector(LoggerMixin):
                 model.to(self.device)
                 model.eval()
                 self.model = model
+                if not self.params:
+                    self.params = {
+                        "model_type": "feedforward_autoencoder",
+                        "encoding_dim": enc_dim,
+                    }
         else:
             self.model = data["model"]
         self.is_fitted = True
         self.logger.info(f"Loaded {self.kpi_name} model from {filepath}")
+
+    # ---- Introspection helpers ----
+    def get_full_params(self) -> Dict[str, Any]:
+        return {
+            "kpi_name": self.kpi_name,
+            "algorithm": self.algorithm,
+            "threshold": float(self.threshold) if self.threshold is not None else None,
+            "params": self.params,
+            "feature_names": self.feature_names,
+            "is_fitted": self.is_fitted,
+        }
 
 
 class KPIAnomalyDetector(LoggerMixin):
@@ -615,6 +718,11 @@ class KPIAnomalyDetector(LoggerMixin):
         if not self.is_fitted:
             return {"error": "Models not fitted yet"}
         return {k: {"algorithm": d.algorithm, "threshold": float(d.threshold), "is_fitted": d.is_fitted} for k, d in self.detectors.items()}
+
+    def get_all_parameters(self) -> Dict[str, Dict[str, Any]]:
+        if not self.is_fitted:
+            return {}
+        return {k: det.get_full_params() for k, det in self.detectors.items()}
 
     def save_all_models(self, models_dir: Optional[str] = None):
         if not self.is_fitted:

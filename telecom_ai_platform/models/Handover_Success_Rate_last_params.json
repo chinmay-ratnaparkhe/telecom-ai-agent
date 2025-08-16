@@ -1,0 +1,8 @@
+{
+  "kpi": "Handover_Success_Rate",
+  "algorithm": "gaussian_mixture",
+  "params": {
+    "n_components": 3,
+    "random_state": 42
+  }
+}

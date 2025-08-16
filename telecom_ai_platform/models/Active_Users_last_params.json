@@ -1,0 +1,9 @@
+{
+  "kpi": "Active_Users",
+  "algorithm": "seasonal_hybrid_esd",
+  "params": {
+    "seasonal_window": 7,
+    "zscore_sigma": 3.0,
+    "max_anom_frac": 0.1
+  }
+}

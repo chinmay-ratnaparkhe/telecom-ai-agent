@@ -1,0 +1,9 @@
+{
+  "kpi": "Packet_Loss",
+  "algorithm": "one_class_svm",
+  "params": {
+    "nu": 0.05,
+    "kernel": "rbf",
+    "gamma": "scale"
+  }
+}
